@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
+*.py[cod]
 *$py.class
 
 # C extensions
@@ -218,3 +219,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Artifacts, Models & Data
+artifacts/
+shap_analysis_output/
+*.csv
+*.pkl
+*.json
+*.onnx
+*.zip
