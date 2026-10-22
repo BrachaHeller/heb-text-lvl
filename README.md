@@ -10,3 +10,4 @@ Continuous Hebrew Readability Assessment and Explainable Linguistic Feature Engi
 Install directly from GitHub:
 ```bash
 pip install git+[https://github.com/GolDL/heb-text-lvl.git](https://github.com/GolDL/heb-text-lvl.git)
+
