@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from dicta_onnx import Dicta
 
@@ -15,6 +15,10 @@ HEBREW_NIKKUD = re.compile(r"[\u0591-\u05C7]")
 VOWELS_RE = re.compile(r"[\u05B1-\u05BB]")
 SHURUK_RE = re.compile(r"\u05D5\u05BC")
 
+# Dicta ONNX character-level BERT has a hard positional embedding limit of 2,048 tokens.
+# Keeping chunks <= 1,800 characters leaves safe headroom for [CLS], [SEP], and special chars.
+MAX_ONNX_CHARS = 1800
+
 _DICTA_ONNX_INSTANCE: Optional[Dicta] = None
 
 
@@ -25,6 +29,76 @@ def _get_dicta_onnx() -> Dicta:
         onnx_path = ensure_dicta_onnx_model()
         _DICTA_ONNX_INSTANCE = Dicta(onnx_path)
     return _DICTA_ONNX_INSTANCE
+
+
+def _split_into_safe_onnx_chunks(text: str, max_chars: int = MAX_ONNX_CHARS) -> List[str]:
+    """Splits text > max_chars along sentence, clause, or word boundaries without dropping words."""
+    if len(text) <= max_chars:
+        return [text]
+
+    # 1. Split by sentence-ending punctuation first
+    raw_segments = re.split(r"(?<=[.!?])\s+", text)
+    safe_segments: List[str] = []
+
+    # 2. If any single sentence is still > max_chars, split by clauses/commas, then words
+    for seg in raw_segments:
+        if len(seg) <= max_chars:
+            safe_segments.append(seg)
+        else:
+            sub_clauses = re.split(r"(?<=[;:,])\s+", seg)
+            for clause in sub_clauses:
+                if len(clause) <= max_chars:
+                    safe_segments.append(clause)
+                else:
+                    # Fallback: pack by whitespace words so no word is ever truncated
+                    words = clause.split()
+                    word_chunk = ""
+                    for w in words:
+                        if len(word_chunk) + len(w) + 1 <= max_chars:
+                            word_chunk = f"{word_chunk} {w}".strip()
+                        else:
+                            if word_chunk:
+                                safe_segments.append(word_chunk)
+                            # Guard against a single contiguous non-whitespace string > max_chars
+                            word_chunk = w[:max_chars]
+                    if word_chunk:
+                        safe_segments.append(word_chunk)
+
+    # 3. Greedily pack segments into chunks up to max_chars to preserve maximum context
+    packed_chunks: List[str] = []
+    current = ""
+    for seg in safe_segments:
+        if not current:
+            current = seg
+        elif len(current) + 1 + len(seg) <= max_chars:
+            current = f"{current} {seg}"
+        else:
+            packed_chunks.append(current)
+            current = seg
+    if current:
+        packed_chunks.append(current)
+
+    return packed_chunks
+
+
+def _vocalize_safely(clean_text: str, dicta_model: Dicta) -> str:
+    """Vocalizes full paragraph if <= 1800 chars, or chunks proactively to prevent 2048-token crash."""
+    if len(clean_text) <= MAX_ONNX_CHARS:
+        try:
+            return dicta_model.add_diacritics(clean_text)
+        except Exception as exc:
+            logger.warning(f"ONNX Vocalization Error on standard text: {exc}")
+            return clean_text
+
+    chunks = _split_into_safe_onnx_chunks(clean_text, max_chars=MAX_ONNX_CHARS)
+    vocalized_parts: List[str] = []
+    for chunk in chunks:
+        try:
+            vocalized_parts.append(dicta_model.add_diacritics(chunk))
+        except Exception as exc:
+            logger.warning(f"ONNX Vocalization Error on chunk (len={len(chunk)}): {exc}")
+            vocalized_parts.append(chunk)
+    return " ".join(vocalized_parts)
 
 
 def get_base_features(text: str) -> Tuple[float, str, int]:
@@ -62,11 +136,7 @@ def get_syllable_features(
         return "", 0, 0.0, 0.0
 
     dicta_model = _get_dicta_onnx()
-    try:
-        vocalized_text = dicta_model.add_diacritics(clean_text)
-    except Exception as exc:
-        logger.warning(f"ONNX Vocalization Error: {exc}")
-        vocalized_text = clean_text
+    vocalized_text = _vocalize_safely(clean_text, dicta_model)
 
     try:
         total_syllables = 0
