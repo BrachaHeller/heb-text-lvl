@@ -1,8 +1,8 @@
-"""Step 2: Leak-proof StratifiedGroupKFold split, Stateful Preprocessing, EDA, and Hybrid 1D Scale."""
+﻿"""Step 2: Leak-proof StratifiedGroupKFold split, Stateful Preprocessing, EDA, and Hybrid 1D Scale."""
 
 import argparse
-import logging
 import os
+import time
 from typing import Dict, Tuple
 
 import joblib
@@ -10,15 +10,12 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedGroupKFold
 
-from hebrew_readability.config import (PipelineConfig, read_table, save_table)
 from features.preprocessor import HebrewReadabilityPreprocessor
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+from hebrew_readability.config import PipelineConfig, setup_pipeline_logger
 
 
 def execute_stratified_group_split(
-    df: pd.DataFrame, cfg: PipelineConfig
+    df: pd.DataFrame, cfg: PipelineConfig, logger
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Splits by passage_title (zero leakage) while stratifying across pedagogical levels."""
     sgkf = StratifiedGroupKFold(
@@ -51,9 +48,16 @@ def execute_stratified_group_split(
     test_df = test_df.reset_index(drop=True)
 
     leakage = set(train_df[cfg.group_col]).intersection(set(test_df[cfg.group_col]))
-    assert len(leakage) == 0, f"Data leakage detected across {len(leakage)} passages!"
+    if len(leakage) > 0:
+        logger.error(f"Data leakage detected across {len(leakage)} passages!")
+        raise AssertionError(f"Data leakage detected across {len(leakage)} passages!")
+
     logger.info(
-        f"Stratified Group Split Complete: Train={len(train_df)} rows, Test={len(test_df)} rows"
+        f"Stratified Group Split Complete (Zero Leakage) | "
+        f"Train: {len(train_df)} rows ({train_df[cfg.group_col].nunique()} passages, "
+        f"{train_df[cfg.level_col].nunique()} levels) | "
+        f"Test: {len(test_df)} rows ({test_df[cfg.group_col].nunique()} passages, "
+        f"{test_df[cfg.level_col].nunique()} levels)"
     )
     return train_df, test_df
 
@@ -62,15 +66,16 @@ def compute_eda_and_hybrid_scale(
     X_train_trans: pd.DataFrame,
     levels_train: pd.Series,
     cfg: PipelineConfig,
+    logger,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """Computes Spearman matrix, per-level distributions, Eta-Squared weights, and 1D Target Scale."""
     df_calc = X_train_trans.copy()
     feature_cols = list(X_train_trans.columns)
 
     # 1. Spearman Correlation Matrix
-    df_calc[feature_cols].corr(method="spearman").save_table(
-        os.path.join(cfg.artifact_dir, "eda_spearman_correlation_matrix.csv")
-    )
+    spearman_path = os.path.join(cfg.artifact_dir, "eda_spearman_correlation_matrix.csv")
+    df_calc[feature_cols].corr(method="spearman").to_csv(spearman_path)
+    logger.info(f"Saved Spearman correlation matrix -> {spearman_path}")
 
     # 2. Per-Level Feature Distributions
     df_calc[cfg.level_col] = levels_train.astype(str).values
@@ -86,9 +91,9 @@ def compute_eda_and_hybrid_scale(
             summary_wide.stack(level=0).reset_index().rename(columns={"level_1": "Feature"})
         )
     cols = ["Feature", cfg.level_col, "count", "mean", "std", "min", "25%", "50%", "75%", "max"]
-    summary_vert[cols].save_table(
-        os.path.join(cfg.artifact_dir, "feature_distributions_per_level.csv"), index=False
-    )
+    dist_path = os.path.join(cfg.artifact_dir, "feature_distributions_per_level.csv")
+    summary_vert[cols].to_csv(dist_path, index=False)
+    logger.info(f"Saved per-level feature distributions -> {dist_path}")
 
     # 3. Eta-Squared & Hybrid Dimensional Weights (0.20 Nikkud / 0.80 Pool)
     eta_results = {}
@@ -117,25 +122,33 @@ def compute_eda_and_hybrid_scale(
     final_eta_df = pd.concat([nikkud_df, rem_df]).sort_values(
         by="Normalized_Weight", ascending=False
     )
-    final_eta_df.save_table(
-        os.path.join(cfg.artifact_dir, "filtered_eta_squared_results.csv"), index=False
-    )
+    eta_path = os.path.join(cfg.artifact_dir, "filtered_eta_squared_results.csv")
+    final_eta_df.to_csv(eta_path, index=False)
     weights = dict(zip(final_eta_df["Feature"], final_eta_df["Normalized_Weight"]))
 
-    # 4. Project 1D Target Scale from Medians & Save filtered_eta_weighted_1d_scale.csv
+    logger.info(
+        "Final Dimensional Weight Distribution:\n"
+        + final_eta_df[["Feature", "Eta_Squared", "Normalized_Weight"]].to_string(index=False)
+    )
+
+    # 4. Project 1D Target Scale from Medians
     medians_df = df_calc.groupby(cfg.level_col)[feature_cols].median().reset_index()
     weight_vec = np.array([weights[col] for col in feature_cols])
     medians_df[cfg.target_col] = (medians_df[feature_cols].values @ weight_vec) * 10.0
-    medians_df.save_table(os.path.join(cfg.artifact_dir, "filtered_medians_vectors.csv"), index=False)
+    medians_path = os.path.join(cfg.artifact_dir, "filtered_medians_vectors.csv")
+    medians_df.to_csv(medians_path, index=False)
 
     scale_df = (
         medians_df[[cfg.level_col, cfg.target_col]]
         .sort_values(by=cfg.target_col)
         .reset_index(drop=True)
     )
-    # Explicitly save the 1D scale CSV requested for HF upload
-    scale_df.save_table(
-        os.path.join(cfg.artifact_dir, "filtered_eta_weighted_1d_scale.csv"), index=False
+    scale_path = os.path.join(cfg.artifact_dir, "filtered_eta_weighted_1d_scale.csv")
+    scale_df.to_csv(scale_path, index=False)
+
+    logger.info(
+        "Supervised 1D Readability Scale (Hybrid Dimensional):\n"
+        + scale_df.to_string(index=False)
     )
 
     level_to_score = dict(zip(scale_df[cfg.level_col].astype(str), scale_df[cfg.target_col]))
@@ -149,14 +162,25 @@ def main():
     args = parser.parse_args()
 
     cfg = PipelineConfig(raw_data_path=args.raw_data, artifact_dir=args.artifact_dir)
-    os.makedirs(cfg.artifact_dir, exist_ok=True)
+    logger = setup_pipeline_logger("pipeline.02_eda_scale", cfg.artifact_dir)
 
-    df = read_table(cfg.raw_data_path)
+    t0 = time.perf_counter()
+    logger.info(f"=== STARTING STEP 02: EDA & HYBRID SCALE | Input: {cfg.raw_data_path} ===")
+
+    df = (
+        pd.read_parquet(cfg.raw_data_path, engine="pyarrow")
+        if str(cfg.raw_data_path).endswith(".parquet")
+        else pd.read_csv(cfg.raw_data_path)
+    )
+    initial_rows = len(df)
     df = df.dropna(subset=[cfg.group_col, cfg.level_col] + cfg.selected_base_features).reset_index(
         drop=True
     )
+    logger.info(
+        f"Loaded dataset: {initial_rows} total rows -> {len(df)} valid rows after dropna."
+    )
 
-    train_df_raw, test_df_raw = execute_stratified_group_split(df, cfg)
+    train_df_raw, test_df_raw = execute_stratified_group_split(df, cfg, logger)
 
     preprocessor = HebrewReadabilityPreprocessor(
         selected_base_features=cfg.selected_base_features,
@@ -166,12 +190,16 @@ def main():
     X_train = preprocessor.fit_transform(train_df_raw)
     X_test = preprocessor.transform(test_df_raw)
 
-    # Save BOTH full preprocessor AND standalone minmax_scaler.pkl to artifacts/
     joblib.dump(preprocessor, os.path.join(cfg.artifact_dir, "readability_preprocessor.pkl"))
     joblib.dump(preprocessor.scaler_, os.path.join(cfg.artifact_dir, "minmax_scaler.pkl"))
-    logger.info("Saved readability_preprocessor.pkl and minmax_scaler.pkl to artifacts/")
+    logger.info(
+        f"Saved readability_preprocessor.pkl and minmax_scaler.pkl | "
+        f"Features out: {preprocessor.feature_names_out_}"
+    )
 
-    _, level_to_score = compute_eda_and_hybrid_scale(X_train, train_df_raw[cfg.level_col], cfg)
+    _, level_to_score = compute_eda_and_hybrid_scale(
+        X_train, train_df_raw[cfg.level_col], cfg, logger
+    )
 
     y_train = train_df_raw[cfg.level_col].astype(str).map(level_to_score)
     y_test = test_df_raw[cfg.level_col].astype(str).map(level_to_score)
@@ -179,12 +207,14 @@ def main():
     keep_meta = [c for c in cfg.metadata_cols if c in df.columns]
     train_export = pd.concat([train_df_raw[keep_meta], X_train], axis=1)
     train_export[cfg.target_col] = y_train.values
-    train_export.save_table(os.path.join(cfg.artifact_dir, "train_dataset.csv"), index=False)
+    train_export.to_csv(os.path.join(cfg.artifact_dir, "train_dataset.csv"), index=False)
 
     test_export = pd.concat([test_df_raw[keep_meta], X_test], axis=1)
     test_export[cfg.target_col] = y_test.values
-    test_export.save_table(os.path.join(cfg.artifact_dir, "test_dataset.csv"), index=False)
-    logger.info("Saved train_dataset.csv and test_dataset.csv.")
+    test_export.to_csv(os.path.join(cfg.artifact_dir, "test_dataset.csv"), index=False)
+
+    elapsed = time.perf_counter() - t0
+    logger.info(f"=== COMPLETED STEP 02 in {elapsed:.2f}s ===")
 
 
 if __name__ == "__main__":

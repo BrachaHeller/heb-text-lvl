@@ -229,3 +229,5 @@ shap_analysis_output/
 *.onnx
 *.zip
 *.parquet
+*.log
+artifacts/

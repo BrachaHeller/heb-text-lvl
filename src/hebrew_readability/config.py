@@ -3,6 +3,9 @@
 from dataclasses import dataclass, field
 from typing import Dict, List
 import pandas as pd
+import logging
+import os
+import sys
 
 # Hugging Face Repositories
 HF_MODEL_REPO_ID = "GolDL/hebrew-readability-classifier"
@@ -50,6 +53,35 @@ def save_table(df: pd.DataFrame, filepath: str) -> None:
         out_df.to_parquet(filepath, index=False, engine="pyarrow")
     else:
         out_df.to_csv(filepath, index=False)
+
+def setup_pipeline_logger(
+    name: str, artifact_dir: str = "artifacts", log_filename: str = "pipeline_execution.log"
+) -> logging.Logger:
+    """Configures a logger that outputs to both stdout and a persistent UTF-8 log file."""
+    os.makedirs(artifact_dir, exist_ok=True)
+    log_path = os.path.join(artifact_dir, log_filename)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if not logger.handlers:
+        formatter = logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)-28s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        # 1. Console Handler (stdout)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        # 2. Persistent File Handler (UTF-8 for Hebrew level names and text)
+        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
 
 
 FINAL_FEATURE_ORDER: List[str] = [

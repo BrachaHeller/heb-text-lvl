@@ -1,5 +1,6 @@
 """Stateful feature selection, log1p transformation, MinMaxScaler, and directional inversion."""
 
+import logging
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -8,6 +9,8 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import MinMaxScaler
 
 from hebrew_readability.config import PipelineConfig
+
+logger = logging.getLogger("hebrew_readability.preprocessor")
 
 
 class HebrewReadabilityPreprocessor(BaseEstimator, TransformerMixin):
@@ -35,9 +38,17 @@ class HebrewReadabilityPreprocessor(BaseEstimator, TransformerMixin):
     def fit(self, X: pd.DataFrame, y=None) -> "HebrewReadabilityPreprocessor":
         df = X[self.selected_base_features].copy()
 
+        skew_series = df.skew()
         self.skewed_cols_ = [
-            col for col in df.columns if abs(df[col].skew()) > self.skew_threshold
+            col for col in df.columns if abs(skew_series[col]) > self.skew_threshold
         ]
+        non_skewed = [c for c in df.columns if c not in self.skewed_cols_]
+        logger.info(
+            f"Preprocessor fit on {len(df)} rows | Skew threshold={self.skew_threshold} | "
+            f"Log-transformed ({len(self.skewed_cols_)}): {self.skewed_cols_} | "
+            f"Linear ({len(non_skewed)}): {non_skewed}"
+        )
+
         self.log_map_ = {
             col: f"{col}_log" if col in self.skewed_cols_ else col for col in df.columns
         }
@@ -61,6 +72,7 @@ class HebrewReadabilityPreprocessor(BaseEstimator, TransformerMixin):
         self.feature_names_out_ = [
             self.inv_map_[self.log_map_[col]] for col in self.selected_base_features
         ]
+        logger.info(f"Final 11 model features (feature_names_out_): {self.feature_names_out_}")
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:

@@ -1,8 +1,8 @@
-"""Step 4: Full evaluation and SHAP suite (100% parity with classification_pipeline.ipynb)."""
+﻿"""Step 4: Full evaluation and SHAP suite with persistent audit logging."""
 
 import argparse
-import logging
 import os
+import time
 from typing import Dict
 
 import joblib
@@ -14,10 +14,7 @@ import xgboost as xgb
 from scipy.stats import norm
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from hebrew_readability.config import (FINAL_FEATURE_ORDER, PipelineConfig, read_table, save_table)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+from hebrew_readability.config import PipelineConfig, setup_pipeline_logger
 
 
 def _run_shap_suite_on_subset(
@@ -25,16 +22,18 @@ def _run_shap_suite_on_subset(
     X_sub: pd.DataFrame,
     levels_sub: pd.Series,
     out_dir: str,
+    logger,
     prefix_label: str = "Global",
 ):
     os.makedirs(out_dir, exist_ok=True)
+    logger.info(f"Computing SHAP values for subset '{prefix_label}' ({len(X_sub)} rows)...")
     shap_values = explainer.shap_values(X_sub)
     feature_cols = list(X_sub.columns)
     level_str_series = levels_sub.astype(str)
 
     shap_df = pd.DataFrame(shap_values, columns=feature_cols)
     shap_df.insert(0, "original_level", level_str_series.values)
-    shap_df.save_table(os.path.join(out_dir, "all_computed_shap_values.csv"), index=False)
+    shap_df.to_csv(os.path.join(out_dir, "all_computed_shap_values.csv"), index=False)
 
     plt.figure(figsize=(12, 8))
     shap.summary_plot(shap_values, X_sub, show=False)
@@ -96,7 +95,7 @@ def _run_shap_suite_on_subset(
 
     pd.DataFrame(level_shap_summary).sort_values(
         by=["Level", "Mean_Abs_SHAP"], ascending=[True, False]
-    ).save_table(os.path.join(out_dir, "all_shap_values_per_level.csv"), index=False)
+    ).to_csv(os.path.join(out_dir, "all_shap_values_per_level.csv"), index=False)
 
     for feat in feature_cols:
         plt.figure(figsize=(8, 6))
@@ -108,6 +107,8 @@ def _run_shap_suite_on_subset(
         )
         plt.close("all")
 
+    logger.info(f"Saved SHAP suite plots and CSVs for '{prefix_label}' -> {out_dir}")
+
 
 def evaluate_and_explain(
     model: xgb.XGBRegressor,
@@ -116,6 +117,7 @@ def evaluate_and_explain(
     test_df_export: pd.DataFrame,
     calibration_stats: Dict[str, Dict[str, float]],
     cfg: PipelineConfig,
+    logger,
 ) -> pd.DataFrame:
     y_pred = model.predict(X_test)
     levels_test = test_df_export[cfg.level_col].astype(str)
@@ -142,7 +144,7 @@ def evaluate_and_explain(
         report_lines.append(f"Level: {lvl:<25} | MAE: {lvl_mae:>6.4f} | RMSE: {lvl_rmse:>6.4f}")
 
     report_text = "\n".join(report_lines)
-    print("\n" + report_text)
+    logger.info("\n" + report_text)
     with open(
         os.path.join(cfg.artifact_dir, "model_evaluation_metrics.txt"), "w", encoding="utf-8"
     ) as f:
@@ -150,7 +152,9 @@ def evaluate_and_explain(
 
     # 2. SHAP Suite (All Levels + Advanced Subset > 4.4)
     explainer = shap.TreeExplainer(model)
-    _run_shap_suite_on_subset(explainer, X_test, levels_test, cfg.shap_dir, prefix_label="All_Levels")
+    _run_shap_suite_on_subset(
+        explainer, X_test, levels_test, cfg.shap_dir, logger, prefix_label="All_Levels"
+    )
 
     adv_mask = (y_test > cfg.advanced_score_threshold).values
     if np.any(adv_mask):
@@ -159,6 +163,7 @@ def evaluate_and_explain(
             X_test.iloc[adv_mask].reset_index(drop=True),
             levels_test.iloc[adv_mask].reset_index(drop=True),
             cfg.shap_advanced_dir,
+            logger,
             prefix_label=f"Advanced_Score_gt_{cfg.advanced_score_threshold}",
         )
 
@@ -221,23 +226,28 @@ def evaluate_and_explain(
         else f"UNDERESTIMATION ({mean_bias:.4f})"
     )
 
-    print("\n" + "=" * 55)
-    print("STAGE 2 & 3: INFERENCE & EVALUATION (TEST SET)")
-    print("=" * 55)
-    print(f"Extended Coverage (P1-P99 Hit Rate):   {(in_ext_hits / total_samples) * 100:.1f}%")
-    print(f"Core Coverage (IQR Hit Rate):          {(in_core_hits / total_samples) * 100:.1f}%")
-    print(f"Top-1 Probability Accuracy:            {(top_1_hits / total_samples) * 100:.1f}%")
-    print(f"Mean Boundary Penalty (Severity):      {np.mean(boundary_penalties):.4f} scale points")
-    print(f"Systematic Model Bias:                 {bias_str}")
-
-    # 4. Error Divergence Visualization
     level_div = (
         eval_out.groupby(cfg.level_col)["Boundary_Penalty"].mean().sort_values(ascending=False)
     )
-    print("\nMean Boundary Penalty per Level:")
-    for lvl, pen in level_div.items():
-        print(f" - {str(lvl):<25}: {pen:.4f}")
+    div_lines = [f" - {str(lvl):<25}: {pen:.4f}" for lvl, pen in level_div.items()]
 
+    coverage_summary = "\n".join(
+        [
+            "=" * 55,
+            "STAGE 2 & 3: INFERENCE & EVALUATION (TEST SET)",
+            "=" * 55,
+            f"Extended Coverage (P1-P99 Hit Rate):   {(in_ext_hits / total_samples) * 100:.1f}%",
+            f"Core Coverage (IQR Hit Rate):          {(in_core_hits / total_samples) * 100:.1f}%",
+            f"Top-1 Probability Accuracy:            {(top_1_hits / total_samples) * 100:.1f}%",
+            f"Mean Boundary Penalty (Severity):      {np.mean(boundary_penalties):.4f} scale points",
+            f"Systematic Model Bias:                 {bias_str}",
+            "\nMean Boundary Penalty per Level:",
+            *div_lines,
+        ]
+    )
+    logger.info("\n" + coverage_summary)
+
+    # 4. Error Divergence Visualization
     plt.figure(figsize=(12, 6))
     bars = plt.bar(
         [str(k) for k in level_div.index], level_div.values, color="coral", edgecolor="black"
@@ -293,24 +303,36 @@ def main():
     args = parser.parse_args()
 
     cfg = PipelineConfig(artifact_dir=args.artifact_dir)
+    logger = setup_pipeline_logger("pipeline.04_eval_shap", cfg.artifact_dir)
+
+    t0 = time.perf_counter()
+    logger.info("=== STARTING STEP 04: TEST EVALUATION & SHAP EXPLAINABILITY ===")
+
     model: xgb.XGBRegressor = joblib.load(
         os.path.join(cfg.artifact_dir, "xgboost_readability_regressor.pkl")
     )
-    test_df = read_table(os.path.join(cfg.artifact_dir, "test_dataset.csv"))
-    calib_df = read_table(
+    test_df = pd.read_csv(os.path.join(cfg.artifact_dir, "test_dataset.csv"))
+    calib_df = pd.read_csv(
         os.path.join(cfg.artifact_dir, "level_calibration_summary.csv"),
         dtype={"pedagogical_level": str},
     )
     calibration_stats = calib_df.set_index("pedagogical_level").to_dict(orient="index")
 
-    X_test = test_df[FINAL_FEATURE_ORDER]
+    preprocessor = joblib.load(os.path.join(cfg.artifact_dir, "readability_preprocessor.pkl"))
+    feature_cols = preprocessor.feature_names_out_
+
+    X_test = test_df[feature_cols]
     y_test = test_df[cfg.target_col]
 
-    eval_df = evaluate_and_explain(model, X_test, y_test, test_df, calibration_stats, cfg)
-    eval_df.save_table(
-        os.path.join(cfg.artifact_dir, "test_dataset_with_predictions.csv"), index=False
+    eval_df = evaluate_and_explain(
+        model, X_test, y_test, test_df, calibration_stats, cfg, logger
     )
-    logger.info("Evaluation and SHAP analysis complete.")
+    preds_path = os.path.join(cfg.artifact_dir, "test_dataset_with_predictions.csv")
+    eval_df.to_csv(preds_path, index=False)
+
+    elapsed = time.perf_counter() - t0
+    logger.info(f"Saved test predictions -> '{preds_path}'")
+    logger.info(f"=== COMPLETED STEP 04 in {elapsed:.2f}s ===")
 
 
 if __name__ == "__main__":

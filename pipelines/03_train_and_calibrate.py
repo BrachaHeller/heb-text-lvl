@@ -1,9 +1,9 @@
-"""Step 3: Trains XGBRegressor and exports canonical level_calibration_summary.csv (+ JSON mirror)."""
+﻿"""Step 3: Trains XGBRegressor and exports canonical level_calibration_summary.csv (+ JSON mirror)."""
 
 import argparse
 import json
-import logging
 import os
+import time
 from typing import Dict
 
 import joblib
@@ -11,10 +11,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from hebrew_readability.config import (FINAL_FEATURE_ORDER, PipelineConfig, read_table, save_table)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+from hebrew_readability.config import PipelineConfig, setup_pipeline_logger
 
 
 def build_and_save_calibration(
@@ -23,6 +20,7 @@ def build_and_save_calibration(
     level_to_score: Dict[str, float],
     output_csv_path: str,
     output_json_path: str,
+    logger,
 ) -> Dict[str, Dict[str, float]]:
     """Saves canonical level_calibration_summary.csv and JSON mirror with interpolated Grades 7 & 10."""
     calib_df = pd.DataFrame({"pred": y_train_preds, "level": levels_train.astype(str).values})
@@ -51,7 +49,7 @@ def build_and_save_calibration(
                 k: float((calibration_stats[lower][k] + calibration_stats[upper][k]) / 2.0)
                 for k in calibration_stats[lower].keys()
             }
-            logger.info(f"Interpolated Grade {missing} derived from {lower} and {upper}")
+            logger.info(f"Interpolated Grade {missing} derived from Grades {lower} and {upper}")
 
     summary_df = (
         pd.DataFrame.from_dict(calibration_stats, orient="index")
@@ -60,12 +58,16 @@ def build_and_save_calibration(
         .sort_values(by="target_readability_score")
         .reset_index(drop=True)
     )
-    summary_df.save_table(output_csv_path, index=False)
+    summary_df.to_csv(output_csv_path, index=False)
 
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(calibration_stats, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"Saved canonical calibration summary to '{output_csv_path}' and '{output_json_path}'.")
+    logger.info(
+        "CALIBRATION SUMMARY (ORIGINAL & INTERPOLATED LEVELS):\n"
+        + summary_df.to_string(index=False, float_format=lambda x: f"{x:.4f}")
+    )
+    logger.info(f"Saved calibration artifacts -> '{output_csv_path}' & '{output_json_path}'")
     return calibration_stats
 
 
@@ -75,17 +77,26 @@ def main():
     args = parser.parse_args()
 
     cfg = PipelineConfig(artifact_dir=args.artifact_dir)
-    train_df = read_table(os.path.join(cfg.artifact_dir, "train_dataset.csv"))
-    scale_df = read_table(
+    logger = setup_pipeline_logger("pipeline.03_train_calib", cfg.artifact_dir)
+
+    t0 = time.perf_counter()
+    logger.info("=== STARTING STEP 03: TRAIN XGBOOST & CALIBRATE LEVELS ===")
+
+    train_df = pd.read_csv(os.path.join(cfg.artifact_dir, "train_dataset.csv"))
+    scale_df = pd.read_csv(
         os.path.join(cfg.artifact_dir, "filtered_eta_weighted_1d_scale.csv"),
         dtype={cfg.level_col: str},
     )
     level_to_score = dict(zip(scale_df[cfg.level_col], scale_df[cfg.target_col]))
 
-    X_train = train_df[FINAL_FEATURE_ORDER]
+    preprocessor = joblib.load(os.path.join(cfg.artifact_dir, "readability_preprocessor.pkl"))
+    feature_cols = preprocessor.feature_names_out_
+    logger.info(f"Loaded fitted preprocessor | Training on {len(feature_cols)} features: {feature_cols}")
+
+    X_train = train_df[feature_cols]
     y_train = train_df[cfg.target_col]
 
-    model = xgb.XGBRegressor(
+    xgb_params = dict(
         objective="reg:squarederror",
         n_estimators=150,
         learning_rate=0.05,
@@ -94,11 +105,13 @@ def main():
         subsample=0.8,
         random_state=cfg.random_state,
     )
+    logger.info(f"Fitting XGBRegressor on {len(X_train)} rows with params: {xgb_params}")
+    model = xgb.XGBRegressor(**xgb_params)
     model.fit(X_train, y_train)
 
     model_path = os.path.join(cfg.artifact_dir, "xgboost_readability_regressor.pkl")
     joblib.dump(model, model_path)
-    logger.info(f"Trained and saved XGBRegressor to '{model_path}'.")
+    logger.info(f"Saved trained XGBRegressor -> '{model_path}'")
 
     y_train_preds = model.predict(X_train)
     build_and_save_calibration(
@@ -107,7 +120,11 @@ def main():
         level_to_score=level_to_score,
         output_csv_path=os.path.join(cfg.artifact_dir, "level_calibration_summary.csv"),
         output_json_path=os.path.join(cfg.artifact_dir, "calibration_stats.json"),
+        logger=logger,
     )
+
+    elapsed = time.perf_counter() - t0
+    logger.info(f"=== COMPLETED STEP 03 in {elapsed:.2f}s ===")
 
 
 if __name__ == "__main__":
