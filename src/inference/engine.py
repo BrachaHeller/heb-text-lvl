@@ -13,11 +13,16 @@ from hebrew_readability.config import (
     HF_DICT_REPO_ID,
     HF_MODEL_REPO_ID,
     LEVEL_DESCRIPTIONS,
-    read_table
+    read_table,
 )
-from features.extractor import FeatureExtractor
-from features.preprocessor import HebrewReadabilityPreprocessor
 from hebrew_readability.hf_hub import download_model_artifacts
+
+try:
+    from features.extractor import FeatureExtractor
+    from features.preprocessor import HebrewReadabilityPreprocessor
+except ImportError:
+    from hebrew_readability.features.extractor import FeatureExtractor
+    from hebrew_readability.features.preprocessor import HebrewReadabilityPreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +40,16 @@ class ReadabilityInferenceEngine:
     ):
         paths = download_model_artifacts(repo_id=model_repo_id, local_dir=artifact_dir)
 
-        self.preprocessor: HebrewReadabilityPreprocessor = joblib.load(paths["preprocessor"])
-        self.model: xgb.XGBRegressor = joblib.load(paths["model"])
+        self.preprocessor = joblib.load(paths["preprocessor"])
+        self.model = joblib.load(paths["model"])
+
+        # Supports both "calibration_table" and "calibration_csv" keys seamlessly
+        calib_path = paths.get("calibration_table") or paths.get("calibration_csv")
+        if not calib_path:
+            raise KeyError(f"Calibration path missing from downloaded artifacts: {paths}")
 
         calib_df = read_table(
-            paths["calibration_csv"],
+            calib_path,
             dtype={"pedagogical_level": str},
         )
         self.calibration_stats: Dict[str, Dict[str, float]] = calib_df.set_index(
