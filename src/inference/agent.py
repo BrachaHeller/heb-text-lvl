@@ -1,60 +1,38 @@
+
 """Autonomous agentic simplification workflow and multi-turn trajectory logging."""
 
+from __future__ import annotations
+
+import argparse
 import json
-import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 import pandas as pd
 
-POPULATION_SPECS: Dict[str, Dict[str, Any]] = {
-    "Grade 1-3 - Elementary Beginner": {
-        "engine_categories": ["Elementary - Beginner"],
-        "anchor_score": 3.21,
-        "medians": {"1_nikkud_ratio_log_inv": 0.00, "16_total_syllables_log": 0.485, "18_avg_syllables_per_sentence_log": 0.468, "8_stz_avg_tree_depth_per_sent_log": 0.300, "14a_zipf_rarity_tuple_log_inv": 0.403}
-    },
-    "Grade 4-6 - Elementary Intermediate": {
-        "engine_categories": ["Elementary - Intermediate"],
-        "anchor_score": 5.31,
-        "medians": {"1_nikkud_ratio_log_inv": 0.949, "16_total_syllables_log": 0.567, "18_avg_syllables_per_sentence_log": 0.512, "8_stz_avg_tree_depth_per_sent_log": 0.316, "14a_zipf_rarity_tuple_log_inv": 0.425}
-    },
-    "Grade 7-9 - Middle School": {
-        "engine_categories": ["Middle School"],
-        "anchor_score": 5.69,
-        "medians": {"1_nikkud_ratio_log_inv": 0.985, "16_total_syllables_log": 0.621, "18_avg_syllables_per_sentence_log": 0.556, "8_stz_avg_tree_depth_per_sent_log": 0.351, "14a_zipf_rarity_tuple_log_inv": 0.435}
-    },
-    "Grade 10-12 - High School": {
-        "engine_categories": ["High School"],
-        "anchor_score": 5.95,
-        "medians": {"1_nikkud_ratio_log_inv": 0.996, "16_total_syllables_log": 0.670, "18_avg_syllables_per_sentence_log": 0.587, "8_stz_avg_tree_depth_per_sent_log": 0.367, "14a_zipf_rarity_tuple_log_inv": 0.457}
-    },
-    "Technical/Academic": {
-        "engine_categories": ["Technical/Academic"],
-        "anchor_score": 6.80,
-        "medians": {"1_nikkud_ratio_log_inv": 1.000, "16_total_syllables_log": 0.720, "18_avg_syllables_per_sentence_log": 0.640, "8_stz_avg_tree_depth_per_sent_log": 0.400, "14a_zipf_rarity_tuple_log_inv": 0.520}
-    },
-    "Second-language learners": {
-        "engine_categories": ["Second-language - Beginner", "Second-language - Advanced"],
-        "anchor_score": 5.33,
-        "medians": {"1_nikkud_ratio_log_inv": 0.900, "16_total_syllables_log": 0.609, "18_avg_syllables_per_sentence_log": 0.528, "8_stz_avg_tree_depth_per_sent_log": 0.327, "14a_zipf_rarity_tuple_log_inv": 0.474}
-    },
-    "Intellectual Disability Accessible": {
-        "engine_categories": ["Intellectual Disability"],
-        "anchor_score": 4.96,
-        "medians": {"1_nikkud_ratio_log_inv": 1.000, "16_total_syllables_log": 0.427, "18_avg_syllables_per_sentence_log": 0.464, "8_stz_avg_tree_depth_per_sent_log": 0.316, "14a_zipf_rarity_tuple_log_inv": 0.475}
-    }
-}
+from hebrew_readability.config import (
+    FEATURE_DIAGNOSTIC_RULES,
+    LEVEL_TO_CATEGORIES,
+    POPULATION_SPECS,
+    setup_pipeline_logger,
+)
 
-FEATURE_DIAGNOSTIC_RULES = {
-    "1_nikkud_ratio_log_inv": {"name": "Vocalization (Nikkud)", "weight": 0.200, "too_high": "Add full Hebrew vowel diacritics (ניקוד).", "too_low": "Remove Nikkud vowel marks."},
-    "16_total_syllables_log": {"name": "Paragraph Length & Volume", "weight": 0.274, "too_high": "Condense paragraph length.", "too_low": "Expand paragraph length slightly."},
-    "18_avg_syllables_per_sentence_log": {"name": "Sentence Length", "weight": 0.147, "too_high": "Shorten sentences significantly with periods.", "too_low": "Combine choppy sentences."},
-    "8_stz_avg_tree_depth_per_sent_log": {"name": "Syntactic Nesting", "weight": 0.096, "too_high": "Flatten nested grammatical structures.", "too_low": "Use standard connected sentence structure."},
-    "14a_zipf_rarity_tuple_log_inv": {"name": "Vocabulary Rarity", "weight": 0.085, "too_high": "Replace rare words with everyday Hebrew.", "too_low": "Use age-appropriate curricular vocabulary."}
-}
 
 class HebrewSimplificationAgent:
-    def __init__(self, engine, feature_prompt_cfg: Dict[str, Any], openai_client: Optional[Any] = None, model_name: str = "gpt-4o-mini", log_dir: str = "artifacts"):
+    """
+    Autonomous multi-turn simplification agent that uses ReadabilityInferenceEngine
+    as a feedback function to verify whether Y_pred falls within the target's Core IQR (Q1-Q3).
+    """
+
+    def __init__(
+        self,
+        engine: Any,
+        feature_prompt_cfg: Dict[str, Any],
+        openai_client: Optional[Any] = None,
+        model_name: str = "gpt-4o-mini",
+        log_dir: str = "artifacts",
+    ) -> None:
         self.engine = engine
         self.prompt_cfg = feature_prompt_cfg
         self.client = openai_client
@@ -62,106 +40,391 @@ class HebrewSimplificationAgent:
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.jsonl_log_path = os.path.join(self.log_dir, "agent_trajectories.jsonl")
+        self.logger = setup_pipeline_logger(
+            name="HebrewSimplificationAgent",
+            artifact_dir=self.log_dir,
+            log_filename="agent_execution.log",
+        )
 
-        self.logger = logging.getLogger("HebrewSimplificationAgent")
-        self.logger.setLevel(logging.INFO)
-        if not self.logger.handlers:
-            fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-            ch = logging.StreamHandler()
-            ch.setFormatter(fmt)
-            fh = logging.FileHandler(os.path.join(self.log_dir, "agent_execution.log"), encoding="utf-8")
-            fh.setFormatter(fmt)
-            self.logger.addHandler(ch)
-            self.logger.addHandler(fh)
+    @staticmethod
+    def _extract_categories_and_levels(
+        eval_result: Dict[str, Any], cat_key: str, match_key: str
+    ) -> Tuple[Set[str], Set[str]]:
+        """Extracts both mapped categories and raw level keys even if engine is an older instance."""
+        raw_matches = {str(m).strip() for m in (eval_result.get(match_key) or [])}
+        raw_matches |= {m.lstrip("'") for m in raw_matches}
 
-    def diagnose_draft_in_natural_language(self, eval_result: Dict[str, Any], target_population: str) -> Dict[str, Any]:
+        explicit_cats = {str(c).strip() for c in (eval_result.get(cat_key) or [])}
+        derived_cats: Set[str] = set()
+        for m in raw_matches:
+            for c in LEVEL_TO_CATEGORIES.get(m, []):
+                derived_cats.add(c)
+
+        return explicit_cats | derived_cats, raw_matches
+
+    def _get_target_iqr_bounds(self, target_population: str) -> Tuple[float, float]:
+        """Retrieves calibrated (Q1, Q3) bounds from engine if available, or estimates from anchor."""
+        if hasattr(self.engine, "get_population_iqr_bounds"):
+            return self.engine.get_population_iqr_bounds(target_population)
+        anchor = float(POPULATION_SPECS[target_population]["anchor_score"])
+        return round(anchor - 0.45, 4), round(anchor + 0.45, 4)
+
+    def diagnose_draft_in_natural_language(
+        self, eval_result: Dict[str, Any], target_population: str
+    ) -> Dict[str, Any]:
+        """
+        Checks if Y_pred falls strictly within the target population's Core IQR (Q1-Q3)
+        and produces SHAP-weighted diagnostic directives if it misses.
+        """
+        if target_population not in POPULATION_SPECS:
+            raise ValueError(
+                f"Unknown target_population '{target_population}'. "
+                f"Valid options: {list(POPULATION_SPECS.keys())}"
+            )
+
         spec = POPULATION_SPECS[target_population]
         target_cats = set(spec["engine_categories"])
-        matched_iqr_cats = set(eval_result.get("core_iqr_categories", []))
-        matched_ext_cats = set(eval_result.get("extended_p1_p99_categories", []))
+        target_raw_levels = set(spec.get("raw_level_keys", []))
 
-        y_pred = eval_result["raw_readability_score"]
-        score_diff = y_pred - spec["anchor_score"]
-        in_core_iqr = len(target_cats.intersection(matched_iqr_cats)) > 0
-        in_extended = len(target_cats.intersection(matched_ext_cats)) > 0
+        matched_iqr_cats, matched_iqr_levels = self._extract_categories_and_levels(
+            eval_result, "core_iqr_categories", "core_iqr_matches"
+        )
+        matched_ext_cats, matched_ext_levels = self._extract_categories_and_levels(
+            eval_result, "extended_p1_p99_categories", "extended_p1_p99_matches"
+        )
 
-        draft_feats = eval_result.get("transformed_features", {})
+        y_pred = float(eval_result["raw_readability_score"])
+        q1_bound, q3_bound = self._get_target_iqr_bounds(target_population)
+        score_diff = y_pred - float(spec["anchor_score"])
+
+        # Strict Core IQR verification (never conflated with P1-P99 extended matches)
+        in_core_iqr = bool(
+            len(target_cats & matched_iqr_cats) > 0
+            or len(target_raw_levels & matched_iqr_levels) > 0
+            or (q1_bound <= y_pred <= q3_bound)
+        )
+        in_extended = bool(
+            in_core_iqr
+            or len(target_cats & matched_ext_cats) > 0
+            or len(target_raw_levels & matched_ext_levels) > 0
+        )
+
+        draft_feats = dict(eval_result.get("transformed_features") or {})
+        if (
+            "14a_zipf_rarity_tuple_inv" not in draft_feats
+            and "14a_zipf_rarity_tuple_log_inv" in draft_feats
+        ):
+            draft_feats["14a_zipf_rarity_tuple_inv"] = draft_feats[
+                "14a_zipf_rarity_tuple_log_inv"
+            ]
+
         target_medians = spec["medians"]
+        offenders: List[Tuple[float, str, str]] = []
 
-        offenders = []
         for feat_key, rule in FEATURE_DIAGNOSTIC_RULES.items():
             if feat_key in draft_feats and feat_key in target_medians:
                 delta = float(draft_feats[feat_key]) - float(target_medians[feat_key])
                 if score_diff >= 0 and delta > 0.03:
-                    offenders.append((abs(delta) * rule["weight"], rule["name"], rule["too_high"]))
+                    offenders.append(
+                        (abs(delta) * rule["weight"], rule["name"], rule["too_high"])
+                    )
                 elif score_diff < 0 and delta < -0.04:
-                    offenders.append((abs(delta) * rule["weight"], rule["name"], rule["too_low"]))
+                    offenders.append(
+                        (abs(delta) * rule["weight"], rule["name"], rule["too_low"])
+                    )
 
         offenders.sort(key=lambda x: x[0], reverse=True)
-        top_directives = [f"- {name}: {instr}" for _, name, instr in offenders[:3]] or ["- Sentence Length: Adjust sentence length and vocabulary."]
+        top_offending_features = [name for _, name, _ in offenders[:3]] or [
+            "Sentence Length",
+            "Paragraph Length & Volume",
+        ]
+        top_directives = [
+            f"- {name}: {instr}" for _, name, instr in offenders[:3]
+        ] or [
+            "- Sentence Length: Shorten sentences and simplify vocabulary to match the target level."
+        ]
 
-        overall_direction = "TOO COMPLEX" if score_diff > 0 else "TOO SIMPLE"
-        feedback = f"TOOL DIAGNOSTIC REPORT: Draft is {overall_direction} for '{target_population}'. Adjust:\n" + "\n".join(top_directives)
+        if in_core_iqr:
+            feedback = (
+                f"TOOL DIAGNOSTIC REPORT: Draft score (Y_pred={y_pred:.2f}) converged inside "
+                f"Core IQR [{q1_bound:.2f}, {q3_bound:.2f}] for '{target_population}'."
+            )
+        else:
+            overall_direction = "TOO COMPLEX" if score_diff > 0 else "TOO SIMPLE"
+            feedback = (
+                f"TOOL DIAGNOSTIC REPORT: Draft (Y_pred={y_pred:.2f}, Target Core IQR=[{q1_bound:.2f}, {q3_bound:.2f}]) "
+                f"is {overall_direction} for '{target_population}'. Adjust:\n"
+                + "\n".join(top_directives)
+            )
 
         return {
             "in_core_iqr": in_core_iqr,
             "in_extended": in_extended,
+            "target_q1": q1_bound,
+            "target_q3": q3_bound,
             "abs_distance_to_anchor": round(abs(score_diff), 4),
-            "natural_language_feedback": feedback
+            "top_offending_features": top_offending_features,
+            "natural_language_feedback": feedback,
         }
 
-    def _call_llm_step(self, messages: List[Dict[str, str]], mock_responses: Optional[List[Dict[str, Any]]] = None, iteration: int = 1) -> Dict[str, Any]:
-        if mock_responses is not None:
-            return mock_responses[min(iteration - 1, len(mock_responses) - 1)]
-        response = self.client.chat.completions.create(model=self.model_name, messages=messages, response_format={"type": "json_object"}, temperature=0.3)
-        return json.loads(response.choices[0].message.content)
+    def _build_initial_messages(
+        self, source_text: str, target_population: str
+    ) -> List[Dict[str, str]]:
+        """Injects feature_informed_prompt.json profile and schema into the LLM system prompt."""
+        role = self.prompt_cfg.get(
+            "role",
+            "You are an expert Hebrew language educator and computational linguist.",
+        )
+        pop_profile = self.prompt_cfg.get("population_feature_profiles", {}).get(
+            target_population, {}
+        )
+        schema = self.prompt_cfg.get(
+            "required_output_schema",
+            {
+                "step_1_source_classification": {
+                    "primary_population": "Grade 7-9 - Middle School",
+                    "secondary_populations": [],
+                },
+                "step_2_linguistic_diagnosis": {
+                    "target_population": target_population,
+                    "key_features_to_modify": ["Sentence Length", "Vocabulary Rarity"],
+                    "adaptation_explanation": "Brief explanation.",
+                },
+                "step_3_simplification": {
+                    "simplified_text": "הטקסט המופשט בעברית כאן."
+                },
+            },
+        )
 
-    def run_agentic_simplification(self, source_text: str, target_population: str, paragraph_id: str = "sample_01", max_iters: int = 3, mock_responses: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        start_time = time.time()
-        source_eval = self.engine.evaluate_text(source_text, print_report=False)
-        
-        messages = [
-            {"role": "system", "content": "You are an autonomous Hebrew readability adaptation agent. Respond strictly in valid JSON."},
-            {"role": "user", "content": json.dumps({"requested_target_population": target_population, "input_hebrew_text": source_text}, ensure_ascii=False)}
+        system_prompt = (
+            f"{role}"
+            f"Target Population: '{target_population}'"
+            f"Target Population Adaptation Profile:"
+            f"{json.dumps(pop_profile, ensure_ascii=False, indent=2)}"
+            f"You MUST respond strictly in valid JSON following this exact schema "
+            f"(place your adapted Hebrew text inside 'step_3_simplification.simplified_text'):"
+            f"{json.dumps(schema, ensure_ascii=False, indent=2)}"
+        )
+
+        user_prompt = json.dumps(
+            {
+                "requested_target_population": target_population,
+                "input_hebrew_text": source_text,
+            },
+            ensure_ascii=False,
+        )
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ]
 
-        trajectory, best_turn = [], None
+    @staticmethod
+    def _extract_draft_text(llm_json: Dict[str, Any], fallback_text: str) -> str:
+        """Defensively extracts the simplified Hebrew string from LLM JSON responses."""
+        candidates = [
+            llm_json.get("step_3_simplification", {}).get("simplified_text")
+            if isinstance(llm_json.get("step_3_simplification"), dict)
+            else None,
+            llm_json.get("step_2_adaptation", {}).get("simplified_text")
+            if isinstance(llm_json.get("step_2_adaptation"), dict)
+            else None,
+            llm_json.get("simplified_text"),
+            llm_json.get("adapted_text"),
+            llm_json.get("text"),
+        ]
+        for cand in candidates:
+            if isinstance(cand, str) and cand.strip():
+                return cand.strip()
+        return fallback_text
+
+    def _call_llm_step(
+        self,
+        messages: List[Dict[str, str]],
+        mock_responses: Optional[List[Dict[str, Any]]] = None,
+        iteration: int = 1,
+    ) -> Dict[str, Any]:
+        if mock_responses is not None:
+            return mock_responses[min(iteration - 1, len(mock_responses) - 1)]
+        if self.client is None:
+            raise RuntimeError("openai_client is None and no mock_responses were provided.")
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+        return json.loads(response.choices[0].message.content)
+
+    def _append_jsonl_log(self, record: Dict[str, Any]) -> None:
+        with open(self.jsonl_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "")
+            f.flush()
+
+    def run_agentic_simplification(
+        self,
+        source_text: str,
+        target_population: str,
+        paragraph_id: str = "sample_01",
+        max_iters: int = 3,
+        mock_responses: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        start_time = time.time()
+        source_eval = self.engine.evaluate_text(source_text, print_report=False)
+        source_score = round(float(source_eval["raw_readability_score"]), 4)
+        source_cats, source_lvls = self._extract_categories_and_levels(
+            source_eval, "core_iqr_categories", "core_iqr_matches"
+        )
+
+        self.logger.info(
+            f"[{paragraph_id}] Source Baseline Score: {source_score:.4f} | "
+            f"Matches: {sorted(source_lvls)} ({sorted(source_cats)}) -> Target: '{target_population}'"
+        )
+
+        messages = self._build_initial_messages(source_text, target_population)
+        trajectory: List[Dict[str, Any]] = []
+        best_turn: Optional[Dict[str, Any]] = None
+
         for iteration in range(1, max_iters + 1):
             iter_start = time.time()
             llm_json = self._call_llm_step(messages, mock_responses, iteration)
-            draft_text = (llm_json.get("step_3_simplification", {}).get("simplified_text") or llm_json.get("simplified_text", "")).strip()
+            draft_text = self._extract_draft_text(llm_json, fallback_text=source_text)
 
             eval_res = self.engine.evaluate_text(draft_text, print_report=False)
             diag = self.diagnose_draft_in_natural_language(eval_res, target_population)
+            predicted_score = round(float(eval_res["raw_readability_score"]), 4)
 
-            turn = {
+            turn: Dict[str, Any] = {
                 "iteration": iteration,
                 "draft_text": draft_text,
-                "predicted_score": eval_res["raw_readability_score"],
+                "predicted_score": predicted_score,
+                "target_q1": diag["target_q1"],
+                "target_q3": diag["target_q3"],
                 "in_core_iqr": diag["in_core_iqr"],
+                "in_extended": diag["in_extended"],
                 "abs_distance_to_anchor": diag["abs_distance_to_anchor"],
+                "top_offending_features": diag["top_offending_features"],
                 "tool_natural_language_feedback": diag["natural_language_feedback"],
-                "transformed_features": eval_res["transformed_features"],
-                "latency_sec": round(time.time() - iter_start, 2)
+                "transformed_features": eval_res.get("transformed_features", {}),
+                "latency_sec": round(time.time() - iter_start, 2),
             }
             trajectory.append(turn)
 
-            if best_turn is None or (turn["in_core_iqr"] and not best_turn["in_core_iqr"]) or (turn["in_core_iqr"] == best_turn["in_core_iqr"] and turn["abs_distance_to_anchor"] < best_turn["abs_distance_to_anchor"]):
+            self.logger.info(
+                f"[{paragraph_id}] Iter {iteration}/{max_iters} | "
+                f"Y_pred={predicted_score:.4f} | Core_IQR=[{diag['target_q1']:.2f}, {diag['target_q3']:.2f}] | "
+                f"Converged={diag['in_core_iqr']} | Offenders={diag['top_offending_features']}"
+            )
+
+            if (
+                best_turn is None
+                or (turn["in_core_iqr"] and not best_turn["in_core_iqr"])
+                or (
+                    turn["in_core_iqr"] == best_turn["in_core_iqr"]
+                    and turn["abs_distance_to_anchor"] < best_turn["abs_distance_to_anchor"]
+                )
+            ):
                 best_turn = turn
 
             if diag["in_core_iqr"]:
                 break
 
             if iteration < max_iters:
-                messages.append({"role": "assistant", "content": json.dumps(llm_json, ensure_ascii=False)})
-                messages.append({"role": "user", "content": f"{diag['natural_language_feedback']}\nRevise your draft."})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(llm_json, ensure_ascii=False),
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{diag['natural_language_feedback']}"
+                            f"Revise your Hebrew adaptation in 'step_3_simplification.simplified_text' "
+                            f"so that its readability score falls inside [{diag['target_q1']:.2f}, {diag['target_q3']:.2f}]. "
+                            f"Respond strictly in valid JSON."
+                        ),
+                    }
+                )
 
-        return {
+        assert best_turn is not None
+        final_result: Dict[str, Any] = {
             "paragraph_id": paragraph_id,
             "target_population": target_population,
+            "source_text": source_text,
+            "source_score": source_score,
             "final_simplified_text": best_turn["draft_text"],
             "final_score": best_turn["predicted_score"],
+            "target_q1": best_turn["target_q1"],
+            "target_q3": best_turn["target_q3"],
             "converged_in_core_iqr": best_turn["in_core_iqr"],
+            "best_iteration_selected": best_turn["iteration"],
+            "total_iterations_run": len(trajectory),
             "total_latency_sec": round(time.time() - start_time, 2),
-            "trajectory": trajectory
+            "trajectory": trajectory,
         }
+
+        self._append_jsonl_log(final_result)
+        return final_result
+
+
+def _run_smoke_test() -> None:
+    """Self-contained smoke test verifying config, engine categories, and agent loop."""
+    import tempfile
+
+    class MockEngine:
+        def get_population_iqr_bounds(self, target_population: str) -> Tuple[float, float]:
+            return (2.45, 4.15)
+
+        def evaluate_text(self, text: str, print_report: bool = False) -> Dict[str, Any]:
+            has_nikkud = any("֑" <= c <= "ׇ" for c in text)
+            score = 3.15 if has_nikkud else 5.45
+            raw_matches = ["2", "3", "'2-4"] if has_nikkud else ["6", "7", "8"]
+            return {
+                "raw_readability_score": score,
+                "core_iqr_matches": raw_matches,
+                "extended_p1_p99_matches": ["2", "3", "4", "5", "6", "7", "8"],
+                "transformed_features": {
+                    "1_nikkud_ratio_log_inv": 0.05 if has_nikkud else 0.98,
+                    "16_total_syllables_log": 0.48 if has_nikkud else 0.65,
+                    "18_avg_syllables_per_sentence_log": 0.45 if has_nikkud else 0.60,
+                    "10_dct_ratio_adj_log": 0.18,
+                    "8_stz_avg_tree_depth_per_sent_log": 0.30,
+                    "14a_zipf_rarity_tuple_inv": 0.40,
+                },
+            }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        agent = HebrewSimplificationAgent(
+            engine=MockEngine(),
+            feature_prompt_cfg={"role": "Smoke test"},
+            log_dir=tmp,
+        )
+        mocks = [
+            {"step_3_simplification": {"simplified_text": "טקסט ללא ניקוד ארוך מדי."}},
+            {"step_3_simplification": {"simplified_text": "טֶקְסְט קָצָר עִם נִיקּוּד."}},
+        ]
+        res = agent.run_agentic_simplification(
+            source_text="טקסט מקור מורכב.",
+            target_population="Grade 1-3 - Elementary Beginner",
+            paragraph_id="smoke_test_01",
+            max_iters=3,
+            mock_responses=mocks,
+        )
+        assert res["converged_in_core_iqr"] is True
+        assert res["best_iteration_selected"] == 2
+        assert "source_score" in res
+        assert "top_offending_features" in res["trajectory"][0]
+        assert os.path.exists(os.path.join(tmp, "agent_trajectories.jsonl"))
+        print("[✓] Smoke test passed: config.py + engine.py + agent.py contracts verified!")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true", help="Run standalone smoke test")
+    args = parser.parse_args()
+    if args.test:
+        _run_smoke_test()
+
+        

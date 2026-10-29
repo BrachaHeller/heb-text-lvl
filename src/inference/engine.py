@@ -1,18 +1,21 @@
+
 """ReadabilityInferenceEngine wrapping feature extraction and frozen HF artifacts."""
 
 import logging
 import os
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import joblib
 import pandas as pd
-import xgboost as xgb
 from scipy.stats import norm
 
 from hebrew_readability.config import (
+    FINAL_FEATURE_ORDER,
     HF_DICT_REPO_ID,
     HF_MODEL_REPO_ID,
     LEVEL_DESCRIPTIONS,
+    LEVEL_TO_CATEGORIES,
+    POPULATION_SPECS,
     read_table,
 )
 from hebrew_readability.hf_hub import download_model_artifacts
@@ -43,7 +46,6 @@ class ReadabilityInferenceEngine:
         self.preprocessor = joblib.load(paths["preprocessor"])
         self.model = joblib.load(paths["model"])
 
-        # Supports both "calibration_table" and "calibration_csv" keys seamlessly
         calib_path = paths.get("calibration_table") or paths.get("calibration_csv")
         if not calib_path:
             raise KeyError(f"Calibration path missing from downloaded artifacts: {paths}")
@@ -71,7 +73,51 @@ class ReadabilityInferenceEngine:
             self.feature_extractor_fn = self._extractor.extract_single_text
         return self.feature_extractor_fn
 
-    def evaluate_features_df(self, df_raw: pd.DataFrame, print_report: bool = True) -> Dict:
+    @staticmethod
+    def _levels_to_categories(levels: List[str]) -> List[str]:
+        """Maps raw calibration level keys to unique pedagogical categories."""
+        cats: List[str] = []
+        for lvl in levels:
+            norm_lvl = str(lvl).strip()
+            mapped = (
+                LEVEL_TO_CATEGORIES.get(norm_lvl)
+                or LEVEL_TO_CATEGORIES.get(norm_lvl.lstrip("'"))
+                or []
+            )
+            for c in mapped:
+                if c not in cats:
+                    cats.append(c)
+        return cats
+
+    def get_population_iqr_bounds(self, target_population: str) -> Tuple[float, float]:
+        """
+        Computes the exact calibrated Core IQR (Q1, Q3) span for a target population
+        by aggregating its constituent levels in self.calibration_stats.
+        """
+        spec = POPULATION_SPECS.get(target_population, {})
+        candidate_keys = set(spec.get("raw_level_keys", []))
+        target_cats = set(spec.get("engine_categories", []))
+
+        q1_vals, q3_vals = [], []
+        for lvl, stats in self.calibration_stats.items():
+            norm_lvl = str(lvl).strip()
+            lvl_cats = set(
+                LEVEL_TO_CATEGORIES.get(norm_lvl)
+                or LEVEL_TO_CATEGORIES.get(norm_lvl.lstrip("'"))
+                or []
+            )
+            if norm_lvl in candidate_keys or norm_lvl.lstrip("'") in candidate_keys or (target_cats & lvl_cats):
+                if "Q1" in stats and "Q3" in stats:
+                    q1_vals.append(float(stats["Q1"]))
+                    q3_vals.append(float(stats["Q3"]))
+
+        if q1_vals and q3_vals:
+            return round(min(q1_vals), 4), round(max(q3_vals), 4)
+
+        anchor = float(spec.get("anchor_score", 5.0))
+        return round(anchor - 0.45, 4), round(anchor + 0.45, 4)
+
+    def evaluate_features_df(self, df_raw: pd.DataFrame, print_report: bool = True) -> Dict[str, Any]:
         """Scores a 1-row DataFrame of raw features and returns calibrated probabilities."""
         X_infer = self.preprocessor.transform(df_raw)
         y_pred = float(self.model.predict(X_infer)[0])
@@ -82,6 +128,9 @@ class ReadabilityInferenceEngine:
         ext_matches = [
             lvl for lvl, s in self.calibration_stats.items() if s["P1"] <= y_pred <= s["P99"]
         ]
+
+        core_categories = self._levels_to_categories(core_matches)
+        ext_categories = self._levels_to_categories(ext_matches)
 
         is_oob = len(ext_matches) == 0
         eval_levels = ext_matches if not is_oob else list(self.calibration_stats.keys())
@@ -117,44 +166,50 @@ class ReadabilityInferenceEngine:
                 f"Most suitable for: {', '.join(top_3_natural)}."
             )
 
+        feat_dict = {
+            k: round(float(v), 6) for k, v in X_infer.iloc[0].to_dict().items()
+        }
+
         payload = {
             "raw_readability_score": round(y_pred, 4),
             "core_iqr_matches": core_matches,
+            "core_iqr_categories": core_categories,
             "extended_p1_p99_matches": ext_matches,
+            "extended_p1_p99_categories": ext_categories,
             "probabilities": sorted_probs,
             "is_out_of_bounds": is_oob,
             "natural_language_summary": summary_text,
-            "transformed_features": X_infer.iloc[0].to_dict(),
+            "transformed_features": feat_dict,
         }
 
         if print_report:
             print(f"\n[+] Raw Continuous Readability Score: {y_pred:.4f}")
-            print(
-                f"[+] Core IQR (Q1-Q3) Matches:         {', '.join(core_matches) if core_matches else 'None'}"
-            )
-            print(
-                f"[+] Extended (P1-P99) Matches:        {', '.join(ext_matches) if ext_matches else 'None'}"
-            )
-            print("\n" + "=" * 65)
+            print(f"[+] Core IQR (Q1-Q3) Matches:         {', '.join(core_matches) if core_matches else 'None'}")
+            print(f"[+] Core IQR Categories:              {', '.join(core_categories) if core_categories else 'None'}")
+            print(f"[+] Extended (P1-P99) Matches:        {', '.join(ext_matches) if ext_matches else 'None'}")
             print("PROBABILISTIC LEVEL MAPPING")
             print("=" * 65)
             for lvl, prob in sorted_probs.items():
                 desc = LEVEL_DESCRIPTIONS.get(lvl, lvl)
                 print(f"▶ {lvl:<24} ({desc:<42}) | {prob:>5.1f}%")
-            print(f"\n[Summary] {summary_text}")
+            print(f"[Summary] {summary_text}")
 
         return payload
 
-    def evaluate_text(self, raw_hebrew_text: str, print_report: bool = True) -> Dict:
+    def evaluate_text(self, raw_hebrew_text: str, print_report: bool = True) -> Dict[str, Any]:
         """Extracts linguistic features from a raw Hebrew string and predicts readability."""
+        if not raw_hebrew_text or not str(raw_hebrew_text).strip():
+            raise ValueError("Cannot evaluate empty or whitespace-only Hebrew text.")
         extractor_fn = self._ensure_extractor()
-        df_raw = extractor_fn(raw_hebrew_text)
+        df_raw = extractor_fn(str(raw_hebrew_text).strip())
         return self.evaluate_features_df(df_raw, print_report=print_report)
 
-    def evaluate_txt_file(self, txt_filepath: str, print_report: bool = True) -> Dict:
+    def evaluate_txt_file(self, txt_filepath: str, print_report: bool = True) -> Dict[str, Any]:
         """Reads a UTF-8 .txt file and evaluates its readability."""
         if not os.path.exists(txt_filepath):
             raise FileNotFoundError(f"Input file not found: {txt_filepath}")
         with open(txt_filepath, "r", encoding="utf-8") as f:
             raw_text = f.read().strip()
         return self.evaluate_text(raw_text, print_report=print_report)
+
+        
