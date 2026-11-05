@@ -428,3 +428,252 @@ if __name__ == "__main__":
         _run_smoke_test()
 
         
+
+
+# --- DELIVERABLE 6 PATCH: Exact Raw-Level IQR Convergence & Length Budgets ---
+RAW_LEVEL_LENGTH_BUDGETS = {
+    "1": "Max 25 words total; 4-6 words per sentence; full Nikkud.",
+    "2": "Max 30 words total; 5-7 words per sentence; full Nikkud.",
+    "3": "Max 32 words total; 6-8 words per sentence; full/partial Nikkud.",
+    "'2-4": "Max 32 words total; 6-8 words per sentence.",
+    "2-4": "Max 32 words total; 6-8 words per sentence.",
+    "4": "Max 35 words total; 7-9 words per sentence (4-5 short sentences).",
+    "5": "Max 40 words total; 8-10 words per sentence.",
+    "6": "Max 45 words total; 9-12 words per sentence.",
+    "'4-9": "Max 45 words total; 10-12 words per sentence.",
+    "4-9": "Max 45 words total; 10-12 words per sentence.",
+    "7": "Max 50 words total; 11-13 words per sentence.",
+    "8": "Max 55 words total; 12-15 words per sentence.",
+    "9": "Max 60 words total; 13-16 words per sentence.",
+    "intellectual_disability": "Max 30 words total; strictly 1 clause (5-8 words) per sentence.",
+    "Hadshon": "Max 35 words total; 6-9 everyday words per sentence.",
+    "Olim_news": "Max 35 words total; 6-9 everyday words per sentence.",
+    "Olim_ragil": "Max 40 words total; 8-10 simple words per sentence.",
+    "מבחני אולפן - רגיל": "Max 40 words total; 8-10 simple words per sentence.",
+    "Olim_mitkadmim": "Max 48 words total; 10-13 words per sentence.",
+    "מבחני אולפן - מתקדמים": "Max 48 words total; 10-13 words per sentence.",
+}
+
+RAW_LEVEL_ALIAS_LOOKUP = {
+    "1": ["1", "2"], "2": ["2"], "3": ["3"], "'2-4": ["'2-4", "2-4"], "2-4": ["'2-4", "2-4"],
+    "4": ["4"], "5": ["5"], "6": ["6"], "'4-9": ["'4-9", "4-9"], "4-9": ["'4-9", "4-9"],
+    "7": ["7"], "8": ["8"], "9": ["9"], "10": ["10"], "11": ["11"], "12": ["12"],
+    "Bagrut": ["Bagrut", "Bagrut_Olim"], "Bagrut_Olim": ["Bagrut_Olim", "Bagrut"],
+    "hearing_impaired": ["hearing_impaired", "Bagrut_hearing_impaired"],
+    "Bagrut_hearing_impaired": ["Bagrut_hearing_impaired", "hearing_impaired"],
+    "intellectual_disability": ["intellectual_disability"],
+    "Hadshon": ["Hadshon", "Olim_news"], "Olim_news": ["Olim_news", "Hadshon"],
+    "Olim_ragil": ["Olim_ragil", "מבחני אולפן - רגיל"],
+    "מבחני אולפן - רגיל": ["מבחני אולפן - רגיל", "Olim_ragil"],
+    "Olim_mitkadmim": ["Olim_mitkadmim", "מבחני אולפן - מתקדמים"],
+    "מבחני אולפן - מתקדמים": ["מבחני אולפן - מתקדמים", "Olim_mitkadmim"],
+}
+
+def _get_raw_level_calibration(engine, target_raw_level: Optional[str], target_population: str):
+    cal_stats = getattr(engine, "calibration_stats", {})
+    if target_raw_level:
+        clean = str(target_raw_level).strip()
+        aliases = RAW_LEVEL_ALIAS_LOOKUP.get(clean, [clean, f"'{clean}", clean.lstrip("'")])
+        for cand in aliases:
+            if cand in cal_stats:
+                s = cal_stats[cand]
+                return round(float(s["Q1"]), 4), round(float(s["Q3"]), 4), round(float(s["mu"]), 4), set(aliases)
+    if hasattr(engine, "get_population_iqr_bounds"):
+        q1, q3 = engine.get_population_iqr_bounds(target_population)
+        anchor = float(POPULATION_SPECS[target_population]["anchor_score"])
+        return q1, q3, anchor, set()
+    anchor = float(POPULATION_SPECS[target_population]["anchor_score"])
+    return round(anchor - 0.45, 4), round(anchor + 0.45, 4), anchor, set()
+
+def _patched_diagnose_draft(
+    self, eval_result: Dict[str, Any], target_population: str, target_raw_level: Optional[str] = None
+) -> Dict[str, Any]:
+    spec = POPULATION_SPECS[target_population]
+    matched_iqr_cats, matched_iqr_levels = self._extract_categories_and_levels(
+        eval_result, "core_iqr_categories", "core_iqr_matches"
+    )
+    matched_ext_cats, matched_ext_levels = self._extract_categories_and_levels(
+        eval_result, "extended_p1_p99_categories", "extended_p1_p99_matches"
+    )
+
+    y_pred = float(eval_result["raw_readability_score"])
+    q1_bound, q3_bound, anchor_score, raw_aliases = _get_raw_level_calibration(
+        self.engine, target_raw_level, target_population
+    )
+    score_diff = y_pred - anchor_score
+
+    if raw_aliases:
+        # Strict raw-level Core IQR verification (prevents stopping at Grade 6 when Target is Grade 4)
+        in_core_iqr = bool((len(raw_aliases & matched_iqr_levels) > 0) or (q1_bound <= y_pred <= q3_bound))
+        in_extended = bool(in_core_iqr or (len(raw_aliases & matched_ext_levels) > 0))
+        target_label = f"Raw Level '{target_raw_level}' ({target_population})"
+    else:
+        target_cats = set(spec["engine_categories"])
+        target_raw_set = set(spec.get("raw_level_keys", []))
+        in_core_iqr = bool(
+            (len(target_cats & matched_iqr_cats) > 0)
+            or (len(target_raw_set & matched_iqr_levels) > 0)
+            or (q1_bound <= y_pred <= q3_bound)
+        )
+        in_extended = bool(
+            in_core_iqr
+            or (len(target_cats & matched_ext_cats) > 0)
+            or (len(target_raw_set & matched_ext_levels) > 0)
+        )
+        target_label = target_population
+
+    draft_feats = dict(eval_result.get("transformed_features") or {})
+    target_medians = spec["medians"]
+    offenders = []
+    for feat_key, rule in FEATURE_DIAGNOSTIC_RULES.items():
+        if feat_key in draft_feats and feat_key in target_medians:
+            delta = float(draft_feats[feat_key]) - float(target_medians[feat_key])
+            if score_diff >= 0 and delta > 0.02:
+                offenders.append((abs(delta) * rule["weight"], rule["name"], rule["too_high"]))
+            elif score_diff < 0 and delta < -0.03:
+                offenders.append((abs(delta) * rule["weight"], rule["name"], rule["too_low"]))
+
+    offenders.sort(key=lambda x: x[0], reverse=True)
+    top_offending_features = [name for _, name, _ in offenders[:3]] or ["Paragraph Length & Volume", "Sentence Length"]
+    top_directives = [f"- {name}: {instr}" for _, name, instr in offenders[:3]] or [
+        "- Sentence Length: Shorten sentences and reduce word count per sentence."
+    ]
+    if target_raw_level and str(target_raw_level) in RAW_LEVEL_LENGTH_BUDGETS and score_diff > 0:
+        top_directives.insert(0, f"- Length & Sentence Budget for Level '{target_raw_level}': {RAW_LEVEL_LENGTH_BUDGETS[str(target_raw_level)]}")
+
+    nl = chr(10)
+    if in_core_iqr:
+        feedback = f"TOOL DIAGNOSTIC REPORT: Draft score (Y_pred={y_pred:.2f}) converged inside Core IQR [{q1_bound:.2f}, {q3_bound:.2f}] for {target_label}."
+    else:
+        direction = "TOO COMPLEX" if score_diff > 0 else "TOO SIMPLE"
+        feedback = (
+            f"TOOL DIAGNOSTIC REPORT: Draft (Y_pred={y_pred:.2f}, Target Core IQR=[{q1_bound:.2f}, {q3_bound:.2f}], Anchor={anchor_score:.2f}) "
+            f"is {direction} for {target_label}. Adjust:{nl}" + nl.join(top_directives[:4])
+        )
+
+    return {
+        "in_core_iqr": in_core_iqr,
+        "in_extended": in_extended,
+        "target_q1": q1_bound,
+        "target_q3": q3_bound,
+        "target_mu": anchor_score,
+        "abs_distance_to_anchor": round(abs(score_diff), 4),
+        "top_offending_features": top_offending_features,
+        "natural_language_feedback": feedback,
+    }
+
+def _patched_run_agentic_simplification(
+    self,
+    source_text: str,
+    target_population: str,
+    paragraph_id: str = "sample_01",
+    max_iters: int = 3,
+    mock_responses: Optional[List[Dict[str, Any]]] = None,
+    target_raw_level: Optional[str] = None,
+    cached_source_eval: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    start_time = time.time()
+    source_eval = cached_source_eval or self.engine.evaluate_text(source_text, print_report=False)
+    source_score = round(float(source_eval["raw_readability_score"]), 4)
+    q1_bound, q3_bound, anchor_score, _ = _get_raw_level_calibration(
+        self.engine, target_raw_level, target_population
+    )
+
+    messages = self._build_initial_messages(source_text, target_population)
+    if target_raw_level:
+        budget_note = RAW_LEVEL_LENGTH_BUDGETS.get(str(target_raw_level), "Keep sentences concise.")
+        messages[0]["content"] += (
+            f"{chr(10)}{chr(10)}EXACT TARGET RAW LEVEL: '{target_raw_level}' "
+            f"(Calibrated Core IQR: [{q1_bound:.2f}, {q3_bound:.2f}], Target Score Anchor: {anchor_score:.2f})."
+            f"{chr(10)}STRICT LENGTH & STRUCTURE BUDGET: {budget_note}"
+        )
+
+    trajectory = []
+    best_turn = None
+    nl = chr(10)
+
+    for iteration in range(1, max_iters + 1):
+        iter_start = time.time()
+        llm_json = self._call_llm_step(messages, mock_responses, iteration)
+        draft_text = self._extract_draft_text(llm_json, fallback_text=source_text)
+
+        eval_res = self.engine.evaluate_text(draft_text, print_report=False)
+        diag = self.diagnose_draft_in_natural_language(
+            eval_res, target_population, target_raw_level=target_raw_level
+        )
+        predicted_score = round(float(eval_res["raw_readability_score"]), 4)
+
+        turn = {
+            "iteration": iteration,
+            "draft_text": draft_text,
+            "predicted_score": predicted_score,
+            "target_q1": diag["target_q1"],
+            "target_q3": diag["target_q3"],
+            "target_mu": diag["target_mu"],
+            "in_core_iqr": diag["in_core_iqr"],
+            "in_extended": diag["in_extended"],
+            "abs_distance_to_anchor": diag["abs_distance_to_anchor"],
+            "top_offending_features": diag["top_offending_features"],
+            "tool_natural_language_feedback": diag["natural_language_feedback"],
+            "transformed_features": eval_res.get("transformed_features", {}),
+            "eval_payload": eval_res,
+            "latency_sec": round(time.time() - iter_start, 2),
+        }
+        trajectory.append(turn)
+
+        self.logger.info(
+            f"[{paragraph_id}] Iter {iteration}/{max_iters} | RawTarget={target_raw_level or target_population} | "
+            f"Y_pred={predicted_score:.4f} | IQR=[{diag['target_q1']:.2f}, {diag['target_q3']:.2f}] | "
+            f"Converged={diag['in_core_iqr']} | Offenders={diag['top_offending_features']}"
+        )
+
+        if (
+            best_turn is None
+            or (turn["in_core_iqr"] and not best_turn["in_core_iqr"])
+            or (
+                turn["in_core_iqr"] == best_turn["in_core_iqr"]
+                and turn["abs_distance_to_anchor"] < best_turn["abs_distance_to_anchor"]
+            )
+        ):
+            best_turn = turn
+
+        if diag["in_core_iqr"]:
+            break
+
+        if iteration < max_iters:
+            messages.append({"role": "assistant", "content": json.dumps(llm_json, ensure_ascii=False)})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"{diag['natural_language_feedback']}{nl}{nl}"
+                        f"Rewrite your Hebrew adaptation in 'step_3_simplification.simplified_text' "
+                        f"so its readability score lands inside [{diag['target_q1']:.2f}, {diag['target_q3']:.2f}]. "
+                        f"Respond strictly in valid JSON."
+                    ),
+                }
+            )
+
+    final_result = {
+        "paragraph_id": paragraph_id,
+        "target_population": target_population,
+        "target_raw_level": target_raw_level,
+        "source_text": source_text,
+        "source_score": source_score,
+        "final_simplified_text": best_turn["draft_text"],
+        "final_score": best_turn["predicted_score"],
+        "final_eval_payload": best_turn["eval_payload"],
+        "target_q1": best_turn["target_q1"],
+        "target_q3": best_turn["target_q3"],
+        "target_mu": best_turn["target_mu"],
+        "converged_in_core_iqr": best_turn["in_core_iqr"],
+        "best_iteration_selected": best_turn["iteration"],
+        "total_iterations_run": len(trajectory),
+        "total_latency_sec": round(time.time() - start_time, 2),
+        "trajectory": [{k: v for k, v in t.items() if k != "eval_payload"} for t in trajectory],
+    }
+    self._append_jsonl_log({k: v for k, v in final_result.items() if k != "final_eval_payload"})
+    return final_result
+
+HebrewSimplificationAgent.diagnose_draft_in_natural_language = _patched_diagnose_draft
+HebrewSimplificationAgent.run_agentic_simplification = _patched_run_agentic_simplification
