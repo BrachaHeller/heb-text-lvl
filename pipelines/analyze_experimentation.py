@@ -1,348 +1,588 @@
-"""
-Phase 4 (Deliverable 6): Comprehensive Quality & Proximity Analysis Script.
-
-Evaluates each row of experimentation_results.csv against its target_level across
-multiple proximity metrics (Exact IQR Hit, Cluster Hit, Broad Category Hit,
-Target Probability Mass, Expected Grade Error, and Min IQR Grade Distance) and
-outputs method-level and level-wise quality tables and visualizations.
-"""
-
+"""Multi-granularity proximity analyzer with Empirical Anchor Error, Scale-Normalized IQR Distance, 14x4 Per-Level Tables, and Paired Statistical Tests."""
 from __future__ import annotations
 
 import argparse
+import json
+import math
+from pathlib import Path
 import re
 import sys
-from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
+from scipy import stats
 
 PROJECT_ROOT = (
     Path(__file__).resolve().parent.parent
     if "__file__" in globals()
     else Path("/content/heb-text-lvl")
 )
-if str(PROJECT_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+for _p in (str(PROJECT_ROOT), str(PROJECT_ROOT / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from hebrew_readability.config import LEVEL_TO_CATEGORIES
+from hebrew_readability.config import (
+    CALIBRATION_DEAD_ZONE_BRIDGES,
+    GRADE_NUMERIC_MAP,
+    K12_GRADE_TRACK_LEVELS,
+    LEVEL_TO_CATEGORIES,
+    POPULATION_SPECS,
+    RAW_LEVEL_ALIASES,
+    RAW_LEVEL_TO_POPULATION,
+    SPECIAL_L2_TRACK_LEVELS,
+    build_empirical_level_anchor_map,
+    compute_scale_normalized_iqr_distance,
+)
 
-# Numeric grade / complexity equivalents for ordinal proximity calculation
-LEVEL_NUMERIC_GRADE: Dict[str, float] = {
-    "1": 1.0,
-    "2": 2.0,
-    "3": 3.0,
-    "'2-4": 3.0,
-    "2-4": 3.0,
-    "4": 4.0,
-    "5": 5.0,
-    "6": 6.0,
-    "'4-9": 6.5,
-    "4-9": 6.5,
-    "7": 7.0,
-    "8": 8.0,
-    "9": 9.0,
-    "10": 10.0,
-    "11": 11.0,
-    "12": 12.0,
-    "Bagrut": 11.5,
-    "Bagrut_Olim": 10.5,
-    "hearing_impaired": 11.0,
-    "Bagrut_hearing_impaired": 11.0,
-    "מבחני אולפן - רגיל": 5.5,
-    "Olim_ragil": 5.5,
-    "מבחני אולפן - מתקדמים": 7.5,
-    "Olim_mitkadmim": 7.5,
-    "Hadshon": 3.5,
-    "Olim_news": 3.5,
-    "intellectual_disability": 3.5,
-}
-
-RAW_LEVEL_ALIASES: Dict[str, Set[str]] = {
-    "1": {"1", "2"},
-    "2": {"2"},
-    "3": {"3"},
-    "'2-4": {"'2-4", "2-4"},
-    "2-4": {"'2-4", "2-4"},
-    "4": {"4"},
-    "5": {"5"},
-    "6": {"6"},
-    "'4-9": {"'4-9", "4-9"},
-    "4-9": {"'4-9", "4-9"},
-    "7": {"7"},
-    "8": {"8"},
-    "9": {"9"},
-    "10": {"10"},
-    "11": {"11"},
-    "12": {"12"},
-    "Bagrut": {"Bagrut", "Bagrut_Olim"},
-    "Bagrut_Olim": {"Bagrut_Olim", "Bagrut"},
-    "hearing_impaired": {"hearing_impaired", "Bagrut_hearing_impaired"},
-    "Bagrut_hearing_impaired": {"Bagrut_hearing_impaired", "hearing_impaired"},
-    "intellectual_disability": {"intellectual_disability"},
-    "Hadshon": {"Hadshon", "Olim_news"},
-    "Olim_news": {"Olim_news", "Hadshon"},
-    "Olim_ragil": {"Olim_ragil", "מבחני אולפן - רגיל"},
-    "מבחני אולפן - רגיל": {"מבחני אולפן - רגיל", "Olim_ragil"},
-    "Olim_mitkadmim": {"Olim_mitkadmim", "מבחני אולפן - מתקדמים"},
-    "מבחני אולפן - מתקדמים": {"מבחני אולפן - מתקדמים", "Olim_mitkadmim"},
-}
+PROMPT_ORDER = ["agentic", "feature_informed", "few_shot_persona", "cot_persona"]
 
 
-def parse_simplified_level_col(s: str) -> List[Tuple[str, float]]:
-    """Parses '11 (13.0%), 12 (12.2%)' into [('11', 13.0), ('12', 12.2)]."""
-    if not isinstance(s, str) or s.startswith("NONE_IN_IQR"):
-        return []
-    parsed: List[Tuple[str, float]] = []
+def parse_simplified_level_string(simp_lvl_str: str) -> Tuple[List[str], Dict[str, float]]:
+    """Parses '5 (48.2%), 6 (51.8%)' into matched level keys and probabilities."""
+    if not isinstance(simp_lvl_str, str) or not simp_lvl_str.strip():
+        return [], {}
+    s = simp_lvl_str.strip()
+    if s.startswith("NONE_IN_IQR"):
+        m = re.search(r"Closest:\s*([^\]\s,]+)", s)
+        if m:
+            closest = m.group(1).strip()
+            return [], {closest: 100.0}
+        return [], {}
+
+    matches: List[str] = []
+    probs: Dict[str, float] = {}
     for part in s.split(","):
         part = part.strip()
-        m = re.match(r"^(.*?)\s*\(([\d\.]+)%\)$", part)
+        if not part:
+            continue
+        m = re.match(r"^(.+?)\s*\(([0-9.]+)%\)$", part)
         if m:
-            parsed.append((m.group(1).strip(), float(m.group(2))))
-        elif part:
-            parsed.append((part, 0.0))
-    return parsed
+            lvl = m.group(1).strip()
+            p = float(m.group(2))
+            matches.append(lvl)
+            probs[lvl] = p
+        else:
+            matches.append(part)
+    if matches and not probs:
+        unif = round(100.0 / len(matches), 2)
+        probs = {m: unif for m in matches}
+    return matches, probs
 
 
-def evaluate_row_proximity(row: pd.Series) -> Dict[str, object]:
-    """Computes multi-dimensional proximity metrics for a single experiment row."""
-    t_lvl = str(row["target_level"]).strip()
-    t_aliases = RAW_LEVEL_ALIASES.get(t_lvl, {t_lvl, f"'{t_lvl}", t_lvl.lstrip("'")})
-    t_cats = set(
-        LEVEL_TO_CATEGORIES.get(t_lvl)
-        or LEVEL_TO_CATEGORIES.get(t_lvl.lstrip("'"))
-        or []
-    )
-    t_grade = LEVEL_NUMERIC_GRADE.get(
-        t_lvl, LEVEL_NUMERIC_GRADE.get(t_lvl.lstrip("'"), np.nan)
-    )
+def get_cluster_equivalents(target_level: str) -> Set[str]:
+    clean = str(target_level).strip()
+    aliases = set(RAW_LEVEL_ALIASES.get(clean, [clean, f"'{clean}", clean.lstrip("'")]))
+    if clean in ("1", "2", "3", "'2-4", "2-4"):
+        aliases |= {"1", "2", "3", "'2-4", "2-4"}
+    elif clean in ("4", "5", "6", "'4-9", "4-9"):
+        aliases |= {"4", "5", "6", "'4-9", "4-9"}
+    elif clean in ("7", "8", "9", "'4-9", "4-9"):
+        aliases |= {"7", "8", "9", "'4-9", "4-9"}
+    elif clean in ("10", "11", "12", "Bagrut"):
+        aliases |= {"10", "11", "12", "Bagrut"}
+    elif clean in ("Hadshon", "Olim_news", "Olim_ragil", "מבחני אולפן - רגיל"):
+        aliases |= {"Hadshon", "Olim_news", "Olim_ragil", "מבחני אולפן - רגיל"}
+    return aliases
 
-    parsed = parse_simplified_level_col(str(row["simplified_level"]))
-    matched_lvls = [lvl for lvl, _ in parsed]
-    matched_set = set(matched_lvls)
-    prob_map = {lvl: prob for lvl, prob in parsed}
 
-    # 1. Exact Raw Level IQR Hit
-    exact_iqr_hit = len(t_aliases & matched_set) > 0
-
-    # 2. Cluster-Inclusive IQR Hit ('2-4 covers 2..4, '4-9 covers 4..9)
-    cluster_iqr_hit = exact_iqr_hit
-    if t_lvl in {"2", "3", "4"} and ({"'2-4", "2-4"} & matched_set):
-        cluster_iqr_hit = True
-    if t_lvl in {"4", "5", "6", "7", "8", "9"} and ({"'4-9", "4-9"} & matched_set):
-        cluster_iqr_hit = True
-
-    # 3. Broad Pedagogical Category Hit
-    matched_cats: Set[str] = set()
-    for lvl in matched_lvls:
-        matched_cats.update(
-            LEVEL_TO_CATEGORIES.get(lvl)
-            or LEVEL_TO_CATEGORIES.get(lvl.lstrip("'"))
-            or []
-        )
-    category_iqr_hit = len(t_cats & matched_cats) > 0
-
-    # 4. Probability Mass Assigned to Exact Target & Target Category
-    target_prob_pct = sum(prob_map.get(a, 0.0) for a in t_aliases)
-    cat_prob_sum_pct = sum(
-        prob
-        for lvl, prob in parsed
-        if len(
-            t_cats
-            & set(
-                LEVEL_TO_CATEGORIES.get(lvl)
-                or LEVEL_TO_CATEGORIES.get(lvl.lstrip("'"))
-                or []
-            )
-        )
-        > 0
-    )
-
-    # 5. Ordinal Grade Proximity Metrics
-    top1_lvl = matched_lvls[0] if matched_lvls else "NONE"
-    valid_grades = [
-        (LEVEL_NUMERIC_GRADE[lvl], prob)
-        for lvl, prob in parsed
-        if lvl in LEVEL_NUMERIC_GRADE
-    ]
-    if valid_grades and not np.isnan(t_grade):
-        total_w = sum(p if p > 0 else 1.0 for _, p in valid_grades)
-        expected_iqr_grade = (
-            sum(g * (p if p > 0 else 1.0) for g, p in valid_grades) / total_w
-        )
-        weighted_grade_err = abs(expected_iqr_grade - t_grade)
-        min_iqr_grade_err = (
-            0.0
-            if exact_iqr_hit
-            else min(abs(g - t_grade) for g, _ in valid_grades)
-        )
+def compute_track_separated_weighted_grade_err(
+    target_level: str,
+    matched_levels: List[str],
+    parsed_probs: Dict[str, float],
+    k12_probs_json: Optional[str] = None,
+    special_probs_json: Optional[str] = None,
+    anchor_map: Optional[Dict[str, float]] = None,
+    target_mu: Optional[float] = None,
+) -> float:
+    """
+    Computes track-separated Calibrated Anchor Distance (Err_mu):
+        Err_mu = | (sum_{k in M} P_k * mu_k) - mu_target |
+    When target_level is a K-12 grade, only K-12 levels contribute to the
+    probability-weighted anchor expectation; when Special/L2, only Special/L2 levels contribute.
+    """
+    active_map = anchor_map or build_empirical_level_anchor_map()
+    clean_t = str(target_level).strip()
+    if target_mu is not None and pd.notna(target_mu):
+        target_anchor = float(target_mu)
     else:
-        expected_iqr_grade = np.nan
-        weighted_grade_err = np.nan
-        min_iqr_grade_err = np.nan
+        target_anchor = active_map.get(
+            clean_t, active_map.get(clean_t.lstrip("'"), 5.31)
+        )
 
-    # 6. Compression ratio (word count reduction vs source text)
-    src_words = max(len(str(row["text"]).split()), 1)
-    simp_words = len(str(row["simplified_text"]).split())
-    word_compression_ratio = round(simp_words / src_words, 2)
+    is_k12_target = (
+        clean_t in K12_GRADE_TRACK_LEVELS or clean_t.lstrip("'") in K12_GRADE_TRACK_LEVELS
+    )
 
+    candidate_probs: Dict[str, float] = {}
+    if is_k12_target and isinstance(k12_probs_json, str) and k12_probs_json.strip():
+        try:
+            candidate_probs = json.loads(k12_probs_json)
+        except Exception:
+            candidate_probs = {}
+    elif not is_k12_target and isinstance(special_probs_json, str) and special_probs_json.strip():
+        try:
+            candidate_probs = json.loads(special_probs_json)
+        except Exception:
+            candidate_probs = {}
+
+    if not candidate_probs:
+        track_set = K12_GRADE_TRACK_LEVELS if is_k12_target else SPECIAL_L2_TRACK_LEVELS
+        specific_track = {
+            k
+            for k in parsed_probs
+            if (k in track_set or k.lstrip("'") in track_set) and k not in ("'4-9", "4-9")
+        }
+        if specific_track:
+            candidate_probs = {k: parsed_probs[k] for k in specific_track}
+        else:
+            candidate_probs = {
+                k: v
+                for k, v in parsed_probs.items()
+                if k in track_set or k.lstrip("'") in track_set
+            } or dict(parsed_probs)
+
+    if not candidate_probs and matched_levels:
+        candidate_probs = {m: 1.0 for m in matched_levels}
+
+    total_w = 0.0
+    weighted_mu = 0.0
+    for lvl, w in candidate_probs.items():
+        mu_val = active_map.get(lvl, active_map.get(lvl.lstrip("'")))
+        if mu_val is not None and float(w) > 0:
+            weighted_mu += float(w) * float(mu_val)
+            total_w += float(w)
+
+    if total_w <= 0:
+        return 0.0
+    return round(abs((weighted_mu / total_w) - target_anchor), 4)
+
+
+def cochrans_q_test(binary_matrix: np.ndarray) -> Tuple[float, float]:
+    """Computes Cochran's Q omnibus statistic across k matched binary treatments (N blocks x k methods)."""
+    N, k = binary_matrix.shape
+    row_totals = np.sum(binary_matrix, axis=1)
+    col_totals = np.sum(binary_matrix, axis=0)
+    grand_total = np.sum(row_totals)
+    denom = k * grand_total - np.sum(row_totals ** 2)
+    if denom <= 0:
+        return 0.0, 1.0
+    num = (k - 1) * (k * np.sum(col_totals ** 2) - (grand_total ** 2))
+    q_stat = float(num / denom)
+    p_val = float(stats.chi2.sf(q_stat, df=k - 1))
+    return round(q_stat, 4), round(p_val, 6)
+
+
+def holm_bonferroni_adjust(p_values: List[float]) -> List[float]:
+    """Applies step-down Holm-Bonferroni family-wise error correction."""
+    m = len(p_values)
+    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
+    adjusted = [0.0] * m
+    running_max = 0.0
+    for rank, (orig_idx, p_val) in enumerate(indexed):
+        adj = min(1.0, p_val * (m - rank))
+        running_max = max(running_max, adj)
+        adjusted[orig_idx] = round(running_max, 6)
+    return adjusted
+
+
+def exact_mcnemar_test(vec_a: np.ndarray, vec_b: np.ndarray) -> Dict[str, Any]:
+    """Computes Exact Binomial McNemar's test on paired binary vectors (vec_a vs vec_b)."""
+    a = int(np.sum((vec_a == 1) & (vec_b == 1)))
+    b = int(np.sum((vec_a == 1) & (vec_b == 0)))
+    c = int(np.sum((vec_a == 0) & (vec_b == 1)))
+    d = int(np.sum((vec_a == 0) & (vec_b == 0)))
+    n_discordant = b + c
+    if n_discordant == 0:
+        p_exact = 1.0
+    else:
+        p_exact = float(stats.binomtest(b, n=n_discordant, p=0.5, alternative="two-sided").pvalue)
+    odds_ratio = round((b + 0.5) / (c + 0.5), 3) if c == 0 else round(b / c, 3)
     return {
-        "paragraph_id": row["paragraph_id"],
-        "target_level": t_lvl,
-        "prompt": row["prompt"],
-        "original_level": row["original_level"],
-        "simplified_score": float(row["simplified_score"]),
-        "exact_iqr_hit": exact_iqr_hit,
-        "cluster_iqr_hit": cluster_iqr_hit,
-        "category_iqr_hit": category_iqr_hit,
-        "target_prob_pct": round(target_prob_pct, 2),
-        "cat_prob_sum_pct": round(cat_prob_sum_pct, 2),
-        "top1_matched_level": top1_lvl,
-        "expected_iqr_grade": round(expected_iqr_grade, 2)
-        if not np.isnan(expected_iqr_grade)
-        else np.nan,
-        "weighted_grade_err": round(weighted_grade_err, 2)
-        if not np.isnan(weighted_grade_err)
-        else np.nan,
-        "min_iqr_grade_err": round(min_iqr_grade_err, 2)
-        if not np.isnan(min_iqr_grade_err)
-        else np.nan,
-        "simplified_words": simp_words,
-        "word_compression_ratio": word_compression_ratio,
+        "both_hit_a": a,
+        "a_only_hit_b": b,
+        "b_only_hit_c": c,
+        "both_miss_d": d,
+        "discordant_pairs_b_plus_c": n_discordant,
+        "odds_ratio_b_over_c": odds_ratio,
+        "p_value_raw": round(p_exact, 6),
     }
 
 
-def run_full_analysis(
-    input_csv: Path,
-    output_dir: Path = Path("artifacts/analysis"),
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Runs row-by-row and method-level quality analysis and saves tables + plots."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.read_csv(input_csv)
+def paired_wilcoxon_with_rank_biserial(
+    x: np.ndarray, y: np.ndarray
+) -> Dict[str, float]:
+    """Runs paired Wilcoxon signed-rank test on continuous errors (x vs y) and computes Rank-Biserial r_rb."""
+    diffs = x - y
+    nonzero = diffs[np.abs(diffs) > 1e-9]
+    n_nz = len(nonzero)
+    if n_nz == 0:
+        return {"wilcoxon_stat": 0.0, "p_value_raw": 1.0, "rank_biserial_r_rb": 0.0, "n_nonzero": 0}
 
-    row_metrics = pd.DataFrame([evaluate_row_proximity(row) for _, row in df.iterrows()])
-    row_csv_path = output_dir / "row_level_proximity_analysis.csv"
-    row_metrics.to_csv(row_csv_path, index=False, encoding="utf-8-sig")
+    ranks = stats.rankdata(np.abs(nonzero))
+    w_plus = float(np.sum(ranks[nonzero > 0]))
+    w_minus = float(np.sum(ranks[nonzero < 0]))
+    total_rank_sum = n_nz * (n_nz + 1) / 2.0
+    r_rb = (w_plus - w_minus) / total_rank_sum
 
-    # Method-level summary
+    try:
+        res = stats.wilcoxon(nonzero, zero_method="wilcox", alternative="two-sided", mode="auto")
+        stat_val = float(res.statistic)
+        p_val = float(res.pvalue)
+    except Exception:
+        stat_val = min(w_plus, w_minus)
+        p_val = 1.0
+
+    return {
+        "wilcoxon_stat": round(stat_val, 4),
+        "p_value_raw": round(p_val, 6),
+        "rank_biserial_r_rb": round(r_rb, 4),
+        "n_nonzero": int(n_nz),
+    }
+
+
+def analyze_experimentation_results(
+    results_csv: Path,
+    output_dir: Optional[Path] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Generates:
+      1. row_level_proximity_analysis.csv (with Calibrated Anchor Error, d_IQR & Signed IQR Residuals)
+      2. method_quality_summary.csv (4 rows)
+      3. level_by_method_summary.csv & level_by_method_pivot_14x4.csv (14 levels x 4 prompts)
+      4. paired_statistical_tests.csv (Cochran's Q, McNemar, Friedman, Wilcoxon + r_rb)
+    """
+    results_csv = Path(results_csv)
+    out_dir = Path(output_dir) if output_dir is not None else results_csv.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    enriched_candidate = results_csv.with_name(results_csv.stem + "_enriched.csv")
+    df = pd.read_csv(enriched_candidate if enriched_candidate.exists() else results_csv)
+
+    empirical_anchor_map = build_empirical_level_anchor_map()
+    if {"target_level", "target_mu"}.issubset(df.columns):
+        for _, r_mu in df[["target_level", "target_mu"]].dropna().drop_duplicates().iterrows():
+            lvl_k = str(r_mu["target_level"]).strip()
+            mu_v = round(float(r_mu["target_mu"]), 4)
+            empirical_anchor_map[lvl_k] = mu_v
+            empirical_anchor_map[lvl_k.lstrip("'")] = mu_v
+            for al in RAW_LEVEL_ALIASES.get(lvl_k, []):
+                empirical_anchor_map[al] = mu_v
+
+    row_records: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        pid = str(row["paragraph_id"])
+        prompt = str(row["prompt"]).strip()
+        target_lvl = str(row["target_level"]).strip()
+        y_pred = float(row["simplified_score"])
+        simp_text = str(row.get("simplified_text") or "")
+        src_text = str(row.get("text") or "")
+
+        matched_lvls, parsed_probs = parse_simplified_level_string(
+            str(row.get("simplified_level") or "")
+        )
+
+        # Apply Dead-Zone Bridge [3.2720, 3.3898] during evaluation if needed
+        for bridge in CALIBRATION_DEAD_ZONE_BRIDGES:
+            if float(bridge["lower_bound"]) <= y_pred <= float(bridge["upper_bound"]):
+                nearest = (
+                    str(bridge["lower_level"])
+                    if y_pred <= float(bridge["midpoint"])
+                    else str(bridge["upper_level"])
+                )
+                if nearest not in matched_lvls:
+                    matched_lvls.append(nearest)
+                for extra_l in bridge.get("always_include_levels", []):
+                    if extra_l not in matched_lvls:
+                        matched_lvls.append(extra_l)
+
+        target_aliases = set(
+            RAW_LEVEL_ALIASES.get(target_lvl, [target_lvl, f"'{target_lvl}", target_lvl.lstrip("'")])
+        )
+        matched_set = set(matched_lvls) | {m.lstrip("'") for m in matched_lvls}
+
+        q1_t = float(row["target_q1"]) if "target_q1" in row and pd.notna(row["target_q1"]) else np.nan
+        q3_t = float(row["target_q3"]) if "target_q3" in row and pd.notna(row["target_q3"]) else np.nan
+        mu_t = float(row["target_mu"]) if "target_mu" in row and pd.notna(row["target_mu"]) else np.nan
+
+        exact_hit = bool(
+            len(target_aliases & matched_set) > 0
+            or (pd.notna(q1_t) and pd.notna(q3_t) and (q1_t <= y_pred <= q3_t))
+        )
+        cluster_set = get_cluster_equivalents(target_lvl)
+        cluster_hit = bool(exact_hit or len(cluster_set & matched_set) > 0)
+
+        pop_name = RAW_LEVEL_TO_POPULATION.get(
+            target_lvl,
+            RAW_LEVEL_TO_POPULATION.get(target_lvl.lstrip("'"), "Grade 4-6 - Elementary Intermediate"),
+        )
+        target_cats = set(POPULATION_SPECS.get(pop_name, {}).get("engine_categories", []))
+        matched_cats: Set[str] = set()
+        for m in matched_set:
+            for c in LEVEL_TO_CATEGORIES.get(m, []) or LEVEL_TO_CATEGORIES.get(f"'{m}", []):
+                matched_cats.add(c)
+        category_hit = bool(cluster_hit or len(target_cats & matched_cats) > 0)
+
+        # Signed IQR Residual Regime (RQ2)
+        if exact_hit:
+            signed_iqr_residual = 0.0
+            failure_regime = "Converged"
+        elif pd.notna(q3_t) and y_pred > q3_t:
+            signed_iqr_residual = round(y_pred - q3_t, 4)
+            failure_regime = "Under-Simplified (Too Complex)"
+        elif pd.notna(q1_t) and y_pred < q1_t:
+            signed_iqr_residual = round(y_pred - q1_t, 4)
+            failure_regime = "Over-Simplified (Too Simple)"
+        else:
+            signed_iqr_residual = 0.0
+            failure_regime = "Out-of-Bounds"
+
+        dist_to_iqr = round(abs(signed_iqr_residual), 4)
+        abs_mu_dist = round(abs(y_pred - mu_t), 4) if pd.notna(mu_t) else np.nan
+        scale_norm_iqr_dist = compute_scale_normalized_iqr_distance(y_pred, q1_t, q3_t)
+
+        # Target probability & category probability sum
+        target_prob = max(
+            [parsed_probs.get(a, 0.0) for a in target_aliases] + [0.0]
+        )
+        cat_prob_sum = sum(
+            p
+            for lvl, p in parsed_probs.items()
+            if set(LEVEL_TO_CATEGORIES.get(lvl, []) or LEVEL_TO_CATEGORIES.get(lvl.lstrip("'"), []))
+            & target_cats
+        )
+
+        # Track-Separated Weighted Empirical Anchor Error (Delta mu_weighted)
+        weighted_grade_err = compute_track_separated_weighted_grade_err(
+            target_level=target_lvl,
+            matched_levels=matched_lvls,
+            parsed_probs=parsed_probs,
+            k12_probs_json=row.get("k12_track_probs_json") if "k12_track_probs_json" in row else None,
+            special_probs_json=row.get("special_track_probs_json") if "special_track_probs_json" in row else None,
+            anchor_map=empirical_anchor_map,
+            target_mu=mu_t if pd.notna(mu_t) else None,
+        )
+
+        target_anchor = (
+            float(mu_t)
+            if pd.notna(mu_t)
+            else empirical_anchor_map.get(
+                target_lvl, empirical_anchor_map.get(target_lvl.lstrip("'"), 5.31)
+            )
+        )
+        if exact_hit:
+            min_iqr_grade_err = 0.0
+        elif matched_lvls:
+            min_iqr_grade_err = round(
+                min(
+                    abs(
+                        empirical_anchor_map.get(
+                            m, empirical_anchor_map.get(m.lstrip("'"), target_anchor)
+                        )
+                        - target_anchor
+                    )
+                    for m in matched_lvls
+                ),
+                4,
+            )
+        else:
+            min_iqr_grade_err = weighted_grade_err
+
+        words_simp = len(simp_text.split())
+        words_src = max(1, len(src_text.split()))
+
+        row_records.append(
+            {
+                **row.to_dict(),
+                "exact_iqr_hit": int(exact_hit),
+                "cluster_iqr_hit": int(cluster_hit),
+                "category_iqr_hit": int(category_hit),
+                "signed_iqr_residual": signed_iqr_residual,
+                "dist_to_target_iqr": dist_to_iqr,
+                "scale_norm_iqr_dist": scale_norm_iqr_dist,
+                "abs_mu_distance": abs_mu_dist,
+                "failure_regime": failure_regime,
+                "target_prob_pct": round(target_prob, 2),
+                "cat_prob_sum_pct": round(min(100.0, cat_prob_sum), 2),
+                "weighted_grade_err": weighted_grade_err,
+                "min_iqr_grade_err": min_iqr_grade_err,
+                "simplified_words": words_simp,
+                "source_words": words_src,
+                "compression_ratio": round(words_simp / words_src, 4),
+            }
+        )
+
+    row_df = pd.DataFrame(row_records)
+    row_df.to_csv(out_dir / "row_level_proximity_analysis.csv", index=False)
+
+    # 1. Method Quality Summary (4 rows)
     method_summary = (
-        row_metrics.groupby("prompt", as_index=False)
+        row_df.groupby("prompt", as_index=False)
         .agg(
             n_rows=("paragraph_id", "count"),
             exact_iqr_hit_pct=("exact_iqr_hit", lambda s: round(s.mean() * 100.0, 2)),
             cluster_iqr_hit_pct=("cluster_iqr_hit", lambda s: round(s.mean() * 100.0, 2)),
             category_iqr_hit_pct=("category_iqr_hit", lambda s: round(s.mean() * 100.0, 2)),
+            under_simplified_pct=(
+                "failure_regime",
+                lambda s: round((s == "Under-Simplified (Too Complex)").mean() * 100.0, 2),
+            ),
+            over_simplified_pct=(
+                "failure_regime",
+                lambda s: round((s == "Over-Simplified (Too Simple)").mean() * 100.0, 2),
+            ),
+            mean_signed_iqr_residual=("signed_iqr_residual", lambda s: round(s.mean(), 4)),
+            mean_dist_to_iqr=("dist_to_target_iqr", lambda s: round(s.mean(), 4)),
+            mean_scale_norm_iqr_dist=("scale_norm_iqr_dist", lambda s: round(s.mean(), 4)),
             mean_target_prob_pct=("target_prob_pct", lambda s: round(s.mean(), 2)),
             mean_cat_prob_sum_pct=("cat_prob_sum_pct", lambda s: round(s.mean(), 2)),
-            mean_weighted_grade_err=("weighted_grade_err", lambda s: round(s.mean(), 2)),
-            mean_min_iqr_grade_err=("min_iqr_grade_err", lambda s: round(s.mean(), 2)),
+            mean_weighted_grade_err=("weighted_grade_err", lambda s: round(s.mean(), 4)),
+            mean_min_iqr_grade_err=("min_iqr_grade_err", lambda s: round(s.mean(), 4)),
             mean_simplified_score=("simplified_score", lambda s: round(s.mean(), 4)),
             std_simplified_score=("simplified_score", lambda s: round(s.std(), 4)),
             mean_words=("simplified_words", lambda s: round(s.mean(), 1)),
-            mean_compression_ratio=("word_compression_ratio", lambda s: round(s.mean(), 2)),
+            mean_compression_ratio=("compression_ratio", lambda s: round(s.mean(), 2)),
         )
-        .sort_values(
-            ["exact_iqr_hit_pct", "mean_cat_prob_sum_pct", "mean_weighted_grade_err"],
-            ascending=[False, False, True],
+        .sort_values("exact_iqr_hit_pct", ascending=False)
+    )
+    method_summary.to_csv(out_dir / "method_quality_summary.csv", index=False)
+
+    # 2. Exact 14 x 4 Per-Level Breakdown Table
+    level_by_method = (
+        row_df.groupby(["target_level", "prompt"], as_index=False)
+        .agg(
+            n_items=("paragraph_id", "count"),
+            exact_hits=("exact_iqr_hit", "sum"),
+            exact_iqr_hit_pct=("exact_iqr_hit", lambda s: round(s.mean() * 100.0, 2)),
+            cluster_iqr_hit_pct=("cluster_iqr_hit", lambda s: round(s.mean() * 100.0, 2)),
+            category_iqr_hit_pct=("category_iqr_hit", lambda s: round(s.mean() * 100.0, 2)),
+            under_simplified_pct=(
+                "failure_regime",
+                lambda s: round((s == "Under-Simplified (Too Complex)").mean() * 100.0, 2),
+            ),
+            over_simplified_pct=(
+                "failure_regime",
+                lambda s: round((s == "Over-Simplified (Too Simple)").mean() * 100.0, 2),
+            ),
+            mean_signed_residual=("signed_iqr_residual", lambda s: round(s.mean(), 4)),
+            mean_scale_norm_iqr_dist=("scale_norm_iqr_dist", lambda s: round(s.mean(), 4)),
+            mean_weighted_grade_err=("weighted_grade_err", lambda s: round(s.mean(), 4)),
+            mean_min_iqr_grade_err=("min_iqr_grade_err", lambda s: round(s.mean(), 4)),
+            mean_score=("simplified_score", lambda s: round(s.mean(), 4)),
         )
     )
-    summary_csv_path = output_dir / "method_quality_summary.csv"
-    method_summary.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
+    level_by_method.to_csv(out_dir / "level_by_method_summary.csv", index=False)
 
-    print("\n" + "=" * 95)
-    print("1. ROW-LEVEL PROXIMITY TO TARGET LEVEL")
-    print("=" * 95)
-    print(
-        row_metrics[
-            [
-                "paragraph_id",
-                "target_level",
-                "prompt",
-                "simplified_score",
-                "exact_iqr_hit",
-                "cluster_iqr_hit",
-                "category_iqr_hit",
-                "cat_prob_sum_pct",
-                "expected_iqr_grade",
-                "weighted_grade_err",
-                "min_iqr_grade_err",
-            ]
-        ].to_string(index=False)
+    # Wide 14 x 4 Pivot Table (Hit Count / N and Hit % per Target Level x Prompt)
+    level_by_method["formatted_hit"] = level_by_method.apply(
+        lambda r: f"{int(r['exact_hits'])}/{int(r['n_items'])} ({r['exact_iqr_hit_pct']:.1f}%)",
+        axis=1,
     )
+    available_prompts = [p for p in PROMPT_ORDER if p in level_by_method["prompt"].unique()]
+    pivot_14x4 = level_by_method.pivot(
+        index="target_level", columns="prompt", values="formatted_hit"
+    )[available_prompts].reset_index()
+    pivot_14x4.to_csv(out_dir / "level_by_method_pivot_14x4.csv", index=False)
 
-    print("\n" + "=" * 95)
-    print("2. AGGREGATED SIMPLIFICATION METHOD QUALITY RANKING")
-    print("=" * 95)
-    print(method_summary.to_string(index=False))
-    print("=" * 95 + "\n")
+    # 3. Paired Statistical Tests (Cochran's Q, Exact McNemar, Friedman, Wilcoxon + r_rb)
+    stat_rows: List[Dict[str, Any]] = []
+    piv_exact = row_df.pivot(index="paragraph_id", columns="prompt", values="exact_iqr_hit").dropna()
+    piv_min_err = row_df.pivot(index="paragraph_id", columns="prompt", values="min_iqr_grade_err").dropna()
+    piv_w_err = row_df.pivot(index="paragraph_id", columns="prompt", values="weighted_grade_err").dropna()
 
-    # Generate comparison plot
-    sns.set_theme(style="whitegrid")
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    if len(available_prompts) >= 2 and len(piv_exact) > 0:
+        q_stat, q_pval = cochrans_q_test(piv_exact[available_prompts].to_numpy())
+        try:
+            f_stat, f_pval = stats.friedmanchisquare(
+                *[piv_min_err[p].to_numpy() for p in available_prompts]
+            )
+            f_stat, f_pval = round(float(f_stat), 4), round(float(f_pval), 6)
+        except Exception:
+            f_stat, f_pval = 0.0, 1.0
 
-    sns.barplot(
-        data=row_metrics,
-        x="target_level",
-        y="simplified_score",
-        hue="prompt",
-        ax=axes[0],
-        palette="viridis",
-    )
-    axes[0].set_title("Simplified Continuous Score by Target Level", fontweight="bold")
-    axes[0].set_xlabel("Target Raw Level")
-    axes[0].set_ylabel("Simplified Score (Y_pred)")
+        baselines = [p for p in available_prompts if p != "agentic"]
+        mcnemar_raw_p: List[float] = []
+        wilcox_min_raw_p: List[float] = []
+        wilcox_w_raw_p: List[float] = []
+        temp_records: List[Dict[str, Any]] = []
 
-    sns.barplot(
-        data=row_metrics,
-        x="target_level",
-        y="weighted_grade_err",
-        hue="prompt",
-        ax=axes[1],
-        palette="viridis",
-    )
-    axes[1].set_title("Weighted IQR Grade Error (Lower = Better)", fontweight="bold")
-    axes[1].set_xlabel("Target Raw Level")
-    axes[1].set_ylabel("|Expected IQR Grade - Target Grade|")
+        for base_p in baselines:
+            if "agentic" not in piv_exact.columns:
+                continue
+            mc = exact_mcnemar_test(
+                piv_exact["agentic"].to_numpy(), piv_exact[base_p].to_numpy()
+            )
+            wx_min = paired_wilcoxon_with_rank_biserial(
+                piv_min_err[base_p].to_numpy(), piv_min_err["agentic"].to_numpy()
+            )
+            wx_w = paired_wilcoxon_with_rank_biserial(
+                piv_w_err[base_p].to_numpy(), piv_w_err["agentic"].to_numpy()
+            )
+            mcnemar_raw_p.append(mc["p_value_raw"])
+            wilcox_min_raw_p.append(wx_min["p_value_raw"])
+            wilcox_w_raw_p.append(wx_w["p_value_raw"])
+            temp_records.append(
+                {
+                    "comparison": f"agentic vs. {base_p}",
+                    "n_paired_blocks": len(piv_exact),
+                    "cochran_q_omnibus": q_stat,
+                    "cochran_q_p_value": q_pval,
+                    "friedman_chi2_omnibus": f_stat,
+                    "friedman_p_value": f_pval,
+                    **mc,
+                    "wilcoxon_min_iqr_err_stat": wx_min["wilcoxon_stat"],
+                    "wilcoxon_min_iqr_err_p_raw": wx_min["p_value_raw"],
+                    "wilcoxon_min_iqr_rank_biserial_r_rb": wx_min["rank_biserial_r_rb"],
+                    "wilcoxon_weighted_err_stat": wx_w["wilcoxon_stat"],
+                    "wilcoxon_weighted_err_p_raw": wx_w["p_value_raw"],
+                    "wilcoxon_weighted_rank_biserial_r_rb": wx_w["rank_biserial_r_rb"],
+                }
+            )
 
-    sns.barplot(
-        data=row_metrics,
-        x="target_level",
-        y="cat_prob_sum_pct",
-        hue="prompt",
-        ax=axes[2],
-        palette="viridis",
-    )
-    axes[2].set_title("Target Category Probability Mass (%)", fontweight="bold")
-    axes[2].set_xlabel("Target Raw Level")
-    axes[2].set_ylabel("Cumulative Target Category Probability (%)")
+        mc_adj = holm_bonferroni_adjust(mcnemar_raw_p)
+        wx_min_adj = holm_bonferroni_adjust(wilcox_min_raw_p)
+        wx_w_adj = holm_bonferroni_adjust(wilcox_w_raw_p)
 
-    plt.tight_layout()
-    plot_path = output_dir / "experimentation_quality_comparison.png"
-    plt.savefig(plot_path, dpi=150)
-    plt.close(fig)
-    print(f"[✓] Saved row analysis -> {row_csv_path}")
-    print(f"[✓] Saved method summary -> {summary_csv_path}")
-    print(f"[✓] Saved comparison plot -> {plot_path}")
+        for idx, rec in enumerate(temp_records):
+            rec["mcnemar_p_holm_bonferroni"] = mc_adj[idx]
+            rec["wilcoxon_min_iqr_err_p_holm"] = wx_min_adj[idx]
+            rec["wilcoxon_weighted_err_p_holm"] = wx_w_adj[idx]
+            stat_rows.append(rec)
 
-    return row_metrics, method_summary
+    paired_stats_df = pd.DataFrame(stat_rows)
+    paired_stats_df.to_csv(out_dir / "paired_statistical_tests.csv", index=False)
+
+    return {
+        "row_level": row_df,
+        "method_summary": method_summary,
+        "level_by_method": level_by_method,
+        "pivot_14x4": pivot_14x4,
+        "paired_tests": paired_stats_df,
+    }
+
+
+def run_full_analysis(
+    input_csv: Path,
+    output_dir: Optional[Path] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Notebook helper returning (row_level_df, method_summary_df)."""
+    outputs = analyze_experimentation_results(results_csv=Path(input_csv), output_dir=output_dir)
+    return outputs["row_level"], outputs["method_summary"]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze experimentation_results.csv")
+    parser = argparse.ArgumentParser(description="Analyze Hebrew Simplification Experimentation Results")
     parser.add_argument(
-        "--input-csv",
+        "--results-csv",
         type=Path,
-        default=Path("artifacts/experimentation_results.csv"),
-        help="Path to experimentation_results.csv",
+        default=PROJECT_ROOT / "artifacts/experimentation_results.csv",
     )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("artifacts/analysis"),
-        help="Directory to save analysis CSVs and charts",
-    )
-    args, _ = parser.parse_known_args()
-    run_full_analysis(input_csv=args.input_csv, output_dir=args.output_dir)
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "artifacts")
+    args = parser.parse_args()
+    outputs = analyze_experimentation_results(args.results_csv, args.output_dir)
+    print("\n=== 1. METHOD QUALITY SUMMARY ===")
+    print(outputs["method_summary"].to_string(index=False))
+    print("\n=== 2. EXACT 14 x 4 PER-LEVEL HIT RATE TABLE ===")
+    print(outputs["pivot_14x4"].to_string(index=False))
+    print("\n=== 3. PAIRED STATISTICAL TESTS (McNEMAR & WILCOXON) ===")
+    print(outputs["paired_tests"].to_string(index=False))

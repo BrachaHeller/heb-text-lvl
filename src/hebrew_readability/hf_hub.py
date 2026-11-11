@@ -25,12 +25,51 @@ def _get_hf_token() -> Optional[str]:
 
 
 def ensure_dicta_onnx_model(cache_dir: str = ".cache") -> str:
-    """Downloads the Dicta ONNX vocalization model if not already present locally."""
+    """Downloads dicta-1.0.int8.onnx (~293 MB) atomically via HF Hub or GitHub Releases and verifies size."""
+    import shutil
+    import subprocess
+    from huggingface_hub import hf_hub_download
+
     os.makedirs(cache_dir, exist_ok=True)
     onnx_path = os.path.join(cache_dir, "dicta-1.0.int8.onnx")
-    if not os.path.exists(onnx_path):
-        logger.info(f"Downloading Dicta ONNX model from {DICT_ONNX_URL}...")
-        urllib.request.urlretrieve(DICT_ONNX_URL, onnx_path)
+    min_expected_bytes = 250 * 1024 * 1024  # 250 MB gate for the 307,492,637-byte model
+
+    if os.path.exists(onnx_path) and os.path.getsize(onnx_path) >= min_expected_bytes:
+        return onnx_path
+
+    if os.path.exists(onnx_path):
+        os.remove(onnx_path)
+
+    # Strategy 1: Download via huggingface_hub (immune to browser URL wrapping)
+    hf_candidates = [
+        {"repo_id": "thewh1teagle/add-diacritics-in-hebrew", "filename": "dicta-1.0.int8.onnx", "repo_type": "space"},
+        {"repo_id": "thewh1teagle/dicta-onnx", "filename": "dicta-1.0.int8.onnx", "repo_type": "model"},
+    ]
+    for cand in hf_candidates:
+        try:
+            dl_path = hf_hub_download(**cand)
+            if os.path.exists(dl_path) and os.path.getsize(dl_path) >= min_expected_bytes:
+                shutil.copyfile(dl_path, onnx_path)
+                return onnx_path
+        except Exception as exc:
+            logger.debug("HF candidate %s failed: %s", cand["repo_id"], exc)
+
+    # Strategy 2: Atomic curl download from GitHub Releases using split URL string
+    gh_url = (
+        "https://"
+        + "github.com/thewh1teagle/dicta-onnx/releases/download/"
+        + "model-files-v1.0/dicta-1.0.int8.onnx"
+    )
+    tmp_path = onnx_path + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    subprocess.run(
+        ["curl", "-L", "--fail", "--retry", "3", "-A", "Mozilla/5.0", "-o", tmp_path, gh_url],
+        check=True,
+    )
+    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < min_expected_bytes:
+        raise RuntimeError(f"Downloaded ONNX file is incomplete: {os.path.getsize(tmp_path)} bytes")
+    os.replace(tmp_path, onnx_path)
     return onnx_path
 
 

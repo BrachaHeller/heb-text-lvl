@@ -15,6 +15,7 @@ shap_analysis_output/
 *.parquet
 *.pkl
 *.onnx
+*.onnx.tmp
 *.zip
 *.jsonl
 *.log
@@ -22,6 +23,7 @@ shap_analysis_output/
 # Keep prompt JSONs tracked, ignore calibration_stats.json in root/artifacts
 artifacts/*.json
 calibration_stats.json
+!prompts/*.json
 
 # Environment & Secrets
 .env
