@@ -256,8 +256,9 @@ def analyze_experimentation_results(
     out_dir = Path(output_dir) if output_dir is not None else results_csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    enriched_candidate = results_csv.with_name(results_csv.stem + "_enriched.csv")
+    enriched_candidate = results_csv if results_csv.stem.endswith("_enriched") else results_csv.with_name(results_csv.stem + "_enriched.csv")
     df = pd.read_csv(enriched_candidate if enriched_candidate.exists() else results_csv)
+    df = df.drop_duplicates(subset=["paragraph_id", "target_level", "prompt"], keep="last").reset_index(drop=True)
 
     empirical_anchor_map = build_empirical_level_anchor_map()
     if {"target_level", "target_mu"}.issubset(df.columns):
@@ -479,16 +480,16 @@ def analyze_experimentation_results(
         axis=1,
     )
     available_prompts = [p for p in PROMPT_ORDER if p in level_by_method["prompt"].unique()]
-    pivot_14x4 = level_by_method.pivot(
-        index="target_level", columns="prompt", values="formatted_hit"
+    pivot_14x4 = level_by_method.pivot_table(
+        index="target_level", columns="prompt", values="formatted_hit", aggfunc="first"
     )[available_prompts].reset_index()
     pivot_14x4.to_csv(out_dir / "level_by_method_pivot_14x4.csv", index=False)
 
     # 3. Paired Statistical Tests (Cochran's Q, Exact McNemar, Friedman, Wilcoxon + r_rb)
     stat_rows: List[Dict[str, Any]] = []
-    piv_exact = row_df.pivot(index="paragraph_id", columns="prompt", values="exact_iqr_hit").dropna()
-    piv_min_err = row_df.pivot(index="paragraph_id", columns="prompt", values="min_iqr_grade_err").dropna()
-    piv_w_err = row_df.pivot(index="paragraph_id", columns="prompt", values="weighted_grade_err").dropna()
+    piv_exact = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="exact_iqr_hit", aggfunc="last").dropna()
+    piv_min_err = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="min_iqr_grade_err", aggfunc="last").dropna()
+    piv_w_err = row_df.pivot_table(index=["paragraph_id", "target_level"], columns="prompt", values="weighted_grade_err", aggfunc="last").dropna()
 
     if len(available_prompts) >= 2 and len(piv_exact) > 0:
         q_stat, q_pval = cochrans_q_test(piv_exact[available_prompts].to_numpy())
