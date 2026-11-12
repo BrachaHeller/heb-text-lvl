@@ -205,27 +205,56 @@ def call_static_llm_json(
 def extract_static_original_and_simplified(
     llm_json: Dict[str, Any], fallback_text: str
 ) -> Tuple[str, str, Optional[Dict[str, Any]]]:
-    orig_candidates = [
-        llm_json.get("classification", {}).get("primary_level")
+    if not isinstance(llm_json, dict):
+        return "Unknown", fallback_text, None
+    out_fmt = llm_json.get("output_format") if isinstance(llm_json.get("output_format"), dict) else {}
+    cls_dict = (
+        llm_json.get("classification")
         if isinstance(llm_json.get("classification"), dict)
-        else None,
-        llm_json.get("step_1_source_classification", {}).get("primary_population")
+        else (out_fmt.get("classification") if isinstance(out_fmt.get("classification"), dict) else {})
+    )
+    step1_dict = (
+        llm_json.get("step_1_source_classification")
         if isinstance(llm_json.get("step_1_source_classification"), dict)
-        else None,
+        else {}
+    )
+    est_list = llm_json.get("estimated_original_raw_levels")
+    est_str = ", ".join(str(x).strip() for x in est_list if str(x).strip()) if isinstance(est_list, list) else None
+    orig_candidates = [
+        cls_dict.get("primary_level"),
+        cls_dict.get("level"),
+        step1_dict.get("primary_population"),
+        step1_dict.get("primary_level"),
+        est_str,
         llm_json.get("original_level"),
+        llm_json.get("source_level"),
     ]
     orig_lvl = next(
-        (str(c).strip() for c in orig_candidates if isinstance(c, str) and c.strip()),
+        (str(c).strip() for c in orig_candidates if isinstance(c, (str, int, float)) and str(c).strip()),
         "Unknown",
     )
-    simp_text = HebrewSimplificationAgent._extract_draft_text(llm_json, fallback_text=fallback_text)
+    simp_candidates = [
+        llm_json.get("step_3_simplification", {}).get("simplified_text")
+        if isinstance(llm_json.get("step_3_simplification"), dict)
+        else None,
+        llm_json.get("step_2_adaptation", {}).get("simplified_text")
+        if isinstance(llm_json.get("step_2_adaptation"), dict)
+        else None,
+        out_fmt.get("simplified_text"),
+        llm_json.get("simplified_text"),
+        llm_json.get("adapted_text"),
+        llm_json.get("rewritten_text"),
+    ]
+    simp_text = next(
+        (str(c).strip() for c in simp_candidates if isinstance(c, str) and str(c).strip()),
+        HebrewSimplificationAgent._extract_draft_text(llm_json, fallback_text=fallback_text),
+    )
     voc_plan = None
     if isinstance(llm_json.get("step_3_simplification"), dict):
         voc_plan = llm_json["step_3_simplification"].get("vocalization_plan")
     elif isinstance(llm_json.get("vocalization_plan"), dict):
         voc_plan = llm_json.get("vocalization_plan")
     return orig_lvl, simp_text, voc_plan
-
 
 def run_experimentation_pipeline(
     input_csv: Path,
@@ -257,7 +286,7 @@ def run_experimentation_pipeline(
 
     prompt_cfgs: Dict[str, Dict[str, Any]] = {}
     prompt_files = {
-        "cot_persona": "cot_persona_prompt.json",
+        "cot_persona": "persona_cot_prompt.json",
         "few_shot_persona": "few_shot_prompt.json",
         "feature_informed": "feature_informed_prompt.json",
     }
@@ -281,7 +310,7 @@ def run_experimentation_pipeline(
         try:
             existing_df = pd.read_csv(output_csv)
             for _, r in existing_df.iterrows():
-                completed_keys.add((str(r["paragraph_id"]), str(r["prompt"])))
+                completed_keys.add((str(r["paragraph_id"]).strip(), str(r["target_level"]).strip(), str(r["prompt"]).strip()))
             logger.info(f"Resuming from checkpoint: {len(completed_keys)} pairs already completed.")
         except Exception:
             completed_keys.clear()
@@ -313,7 +342,7 @@ def run_experimentation_pipeline(
             src_words = max(1, len(source_text.split()))
 
             for p_name in prompts_to_run:
-                if (pid, p_name) in completed_keys:
+                if (str(pid).strip(), str(target_level).strip(), str(p_name).strip()) in completed_keys:
                     continue
 
                 if p_name == "agentic":
