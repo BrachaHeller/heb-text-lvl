@@ -328,6 +328,7 @@ def _agent_build_initial_messages(
         {"role": "user", "content": user_content},
     ]
 
+
 def _agent_call_llm_json(
     self,
     messages: List[Dict[str, str]],
@@ -337,15 +338,50 @@ def _agent_call_llm_json(
 ) -> Dict[str, Any]:
     if mock_responses is not None and len(mock_responses) > 0:
         return mock_responses[min(iteration - 1, len(mock_responses) - 1)]
-    if self.openai_client is None:
+
+    if self.gemini_client is None and self.openai_client is None:
         return {
             "step_3_simplification": {
                 "simplified_text": "זהו טקסט מופשט וברור לבדיקת המערכת.",
-                "vocalization_plan": {"mode": "continuous", "target_diacritic_ratio": 0.25, "words_to_vocalize": []},
+                "vocalization_plan": {
+                    "mode": "continuous",
+                    "target_diacritic_ratio": 0.25,
+                    "words_to_vocalize": [],
+                },
             }
         }
+
     for attempt in range(1, 4):
         try:
+            if self.gemini_client is not None:
+                from google.genai import types
+
+                system_instruction = next(
+                    (m["content"] for m in messages if m["role"] == "system"),
+                    None,
+                )
+
+                contents = [
+                    types.Content(
+                        role="model" if m["role"] == "assistant" else "user",
+                        parts=[types.Part.from_text(text=m["content"])],
+                    )
+                    for m in messages
+                    if m["role"] != "system"
+                ]
+
+                resp = self.gemini_client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        temperature=temperature,
+                    ),
+                )
+
+                return json.loads(resp.text)
+
             resp = self.openai_client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
@@ -353,10 +389,12 @@ def _agent_call_llm_json(
                 temperature=temperature,
             )
             return json.loads(resp.choices[0].message.content)
+
         except Exception:
             if attempt == 3:
                 raise
             time.sleep(2.0 ** attempt)
+
     return {}
 
 def _safe_run_agentic_simplification(
