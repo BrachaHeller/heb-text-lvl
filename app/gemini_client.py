@@ -9,7 +9,7 @@ def create_gemini_client():
     load_dotenv()
 
     api_key = os.getenv("GEMINI_API_KEY")
- model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
     if not api_key:
         raise RuntimeError(
