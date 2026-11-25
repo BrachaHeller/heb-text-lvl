@@ -49,12 +49,14 @@ class HebrewSimplificationAgent:
         engine: Any,
         feature_prompt_cfg: Dict[str, Any],
         openai_client: Optional[Any] = None,
+        gemini_client: Optional[Any] = None,
         model_name: str = DEFAULT_LLM_MODEL,
         log_dir: str = "artifacts",
     ) -> None:
         self.engine = engine
         self.feature_prompt_cfg = feature_prompt_cfg or {}
         self.openai_client = openai_client
+        self.gemini_client = gemini_client
         self.model_name = model_name or DEFAULT_LLM_MODEL
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
