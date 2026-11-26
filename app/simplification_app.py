@@ -201,7 +201,7 @@ with gr.Blocks(
 
     gr.Markdown("## התוצאה הסופית")
 
-      final_output = gr.Textbox(
+    final_output = gr.Textbox(
         label="הטקסט המותאם",
         lines=10,
         rtl=True,
