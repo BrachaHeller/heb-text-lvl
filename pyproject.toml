@@ -30,6 +30,7 @@ dependencies = [
     "statsmodels>=0.14.0",
     "matplotlib>=3.7.0",
     "requests>=2.31.0",
+    "gradio>=5.0",
 ]
 
 [tool.setuptools.packages.find]
