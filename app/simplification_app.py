@@ -207,8 +207,7 @@ with gr.Blocks(
         rtl=True,
     )
 
-    summary_output = gr.Markdown(
-        label="סיכום התהליך",
+      summary_output = gr.Markdown()
     )
 
     gr.Markdown("## שלבי העבודה של הסוכן")
